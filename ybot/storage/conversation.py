@@ -1,0 +1,162 @@
+"""对话存储模块。
+
+使用 SQLite 存储多轮对话历史，按 session_key 隔离不同会话。
+"""
+
+from __future__ import annotations
+
+import os
+import time
+
+import aiosqlite
+
+from ybot.utils.logger import get_logger
+
+logger = get_logger("存储")
+
+# 建表 SQL
+_CREATE_TABLES_SQL = """\
+CREATE TABLE IF NOT EXISTS sessions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_key TEXT    UNIQUE NOT NULL,
+    created_at  REAL   NOT NULL,
+    updated_at  REAL   NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    role       TEXT    NOT NULL,
+    content    TEXT    NOT NULL,
+    created_at REAL   NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session_time
+    ON messages (session_id, created_at);
+"""
+
+
+class ConversationStore:
+    """对话存储层，封装所有 SQLite 操作。
+
+    Attributes:
+        _db_path: 数据库文件路径。
+        _db: aiosqlite 数据库连接。
+    """
+
+    def __init__(self, db_path: str = "data/conversations.db") -> None:
+        self._db_path = db_path
+        self._db: aiosqlite.Connection | None = None
+
+    async def initialize(self) -> None:
+        """创建数据库连接并建表（IF NOT EXISTS）。
+
+        自动创建 data/ 目录（如果不存在）。
+        """
+        os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
+        self._db = await aiosqlite.connect(self._db_path)
+        await self._db.executescript(_CREATE_TABLES_SQL)
+        await self._db.commit()
+        logger.info(f"对话存储已初始化: {self._db_path}")
+
+    async def close(self) -> None:
+        """关闭数据库连接。"""
+        if self._db:
+            await self._db.close()
+            self._db = None
+            logger.info("对话存储已关闭")
+
+    async def add_message(self, session_key: str, role: str, content: str) -> None:
+        """向指定会话添加一条消息。如果会话不存在则自动创建。
+
+        Args:
+            session_key: 会话标识（如 ``private:12345`` 或 ``group:67890``）。
+            role: 消息角色（``user`` / ``assistant``）。
+            content: 消息文本内容。
+        """
+        assert self._db is not None, "ConversationStore 未初始化"
+
+        now = time.time()
+
+        # 确保 session 存在（INSERT OR IGNORE + UPDATE updated_at）
+        await self._db.execute(
+            "INSERT OR IGNORE INTO sessions (session_key, created_at, updated_at) "
+            "VALUES (?, ?, ?)",
+            (session_key, now, now),
+        )
+        await self._db.execute(
+            "UPDATE sessions SET updated_at = ? WHERE session_key = ?",
+            (now, session_key),
+        )
+
+        # 获取 session_id
+        cursor = await self._db.execute(
+            "SELECT id FROM sessions WHERE session_key = ?",
+            (session_key,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        session_id: int = row[0]
+
+        # 插入消息
+        await self._db.execute(
+            "INSERT INTO messages (session_id, role, content, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id, role, content, now),
+        )
+        await self._db.commit()
+
+    async def get_history(
+        self, session_key: str, limit: int = 20
+    ) -> list[dict[str, str]]:
+        """获取指定会话的最近 N 条消息。
+
+        Args:
+            session_key: 会话标识。
+            limit: 最大返回消息数。
+
+        Returns:
+            按时间升序排列的消息列表，每条为
+            ``{"role": "user"|"assistant", "content": "..."}``。
+        """
+        assert self._db is not None, "ConversationStore 未初始化"
+
+        # 子查询取最近 N 条（DESC），外层再按时间正序排列
+        cursor = await self._db.execute(
+            "SELECT role, content FROM ("
+            "  SELECT m.role, m.content, m.created_at "
+            "  FROM messages m "
+            "  JOIN sessions s ON m.session_id = s.id "
+            "  WHERE s.session_key = ? "
+            "  ORDER BY m.created_at DESC "
+            "  LIMIT ?"
+            ") ORDER BY created_at ASC",
+            (session_key, limit),
+        )
+        rows = await cursor.fetchall()
+
+        return [{"role": r[0], "content": r[1]} for r in rows]
+
+    async def clear_session(self, session_key: str) -> None:
+        """清空指定会话的所有消息（保留 session 记录）。
+
+        Args:
+            session_key: 会话标识。
+        """
+        assert self._db is not None, "ConversationStore 未初始化"
+
+        cursor = await self._db.execute(
+            "SELECT id FROM sessions WHERE session_key = ?",
+            (session_key,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return
+
+        session_id: int = row[0]
+        await self._db.execute(
+            "DELETE FROM messages WHERE session_id = ?",
+            (session_id,),
+        )
+        await self._db.commit()

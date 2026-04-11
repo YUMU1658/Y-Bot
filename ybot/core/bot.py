@@ -26,6 +26,7 @@ from ybot.models.event import (
 )
 from ybot.models.message import segments_to_text
 from ybot.services.ai_chat import AIChatService
+from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger, setup_logger
 
 
@@ -56,7 +57,8 @@ class Bot:
         self._ws_server.set_event_handler(self._on_raw_event)
 
         # 初始化 AI 对话服务
-        self._ai_chat = AIChatService(config.ai)
+        self._conv_store = ConversationStore()
+        self._ai_chat = AIChatService(config.ai, self._conv_store)
 
         self._running = False
 
@@ -83,6 +85,7 @@ class Bot:
                 loop.add_signal_handler(sig, self._signal_handler)
 
         # 启动 AI 服务（需在事件循环中创建 aiohttp 会话）
+        await self._conv_store.initialize()
         await self._ai_chat.start()
         await self._ws_server.start()
 
@@ -106,6 +109,7 @@ class Bot:
         self._logger.info("正在关闭 Y-BOT...")
         await self._ws_server.stop()
         await self._ai_chat.stop()
+        await self._conv_store.close()
         self._logger.info("Y-BOT 已关闭")
 
     async def _on_raw_event(self, data: dict[str, Any]) -> None:
@@ -127,13 +131,15 @@ class Bot:
                 if self._is_at_me(e):
                     text = self._extract_text(e)
                     if text.strip():
-                        reply = await self._ai_chat.chat(text)
+                        session_key = f"group:{e.group_id}"
+                        reply = await self._ai_chat.chat(session_key, text)
                         await self.send_group_msg(e.group_id, reply)
             case PrivateMessageEvent() as e:
                 self._log_private_message(e)
                 text = self._extract_text(e)
                 if text.strip():
-                    reply = await self._ai_chat.chat(text)
+                    session_key = f"private:{e.user_id}"
+                    reply = await self._ai_chat.chat(session_key, text)
                     await self.send_private_msg(e.user_id, reply)
             case MessageEvent() as e:
                 # 兜底：未知消息类型

@@ -9,3 +9,5 @@ log_level = "INFO"    # DEBUG / INFO / WARNING / ERROR
 api_base = "https://api.openai.com/v1"   # API 地址（兼容 OpenAI 格式的任意服务）
 api_key = ""                               # API 密钥
 model = "gpt-4o-mini"                      # 模型 ID
+system_prompt = ""                         # 系统提示词（可选，留空则不发送）
+max_history = 20                           # 每次请求携带的最大历史消息数

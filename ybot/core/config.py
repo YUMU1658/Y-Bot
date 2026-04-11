@@ -26,6 +26,8 @@ log_level = "INFO"    # DEBUG / INFO / WARNING / ERROR
 api_base = "https://api.openai.com/v1"   # API 地址（兼容 OpenAI 格式的任意服务）
 api_key = ""                               # API 密钥
 model = "gpt-4o-mini"                      # 模型 ID
+system_prompt = ""                         # 系统提示词（可选，留空则不发送）
+max_history = 20                           # 每次请求携带的最大历史消息数
 """
 
 
@@ -51,6 +53,8 @@ class AIConfig:
     api_base: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
+    system_prompt: str = ""
+    max_history: int = 20
 
 
 @dataclass
@@ -101,6 +105,8 @@ class Config:
             api_base=ai_data.get("api_base", "https://api.openai.com/v1"),
             api_key=ai_data.get("api_key", ""),
             model=ai_data.get("model", "gpt-4o-mini"),
+            system_prompt=ai_data.get("system_prompt", ""),
+            max_history=ai_data.get("max_history", 20),
         )
 
         return cls(server=server, bot=bot, ai=ai)
