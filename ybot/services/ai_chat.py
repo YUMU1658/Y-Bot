@@ -48,20 +48,23 @@ class AIChatService:
             self._session = None
             logger.info("AI 服务已关闭")
 
-    async def chat(self, session_key: str, user_message: str) -> str:
+    async def chat(
+        self, session_key: str, user_message: str, env_header: str = ""
+    ) -> str:
         """发送多轮对话请求，返回 AI 回复文本。
 
         流程：
         1. 将用户消息存入数据库
         2. 从数据库获取历史消息
-        3. 构建 messages 列表（可选 system prompt + 历史）
+        3. 构建 messages 列表（env_header + system prompt 拼接为 system message + 历史）
         4. 调用 OpenAI API
         5. 将 AI 回复存入数据库
         6. 返回回复文本
 
         Args:
             session_key: 会话标识（如 ``friend_12345``、``group_67890`` 或 ``temp_11111_22222``）。
-            user_message: 用户消息文本。
+            user_message: 用户消息文本（已包含元信息格式化）。
+            env_header: ENV 头部文本（可选），拼接到 system prompt 前面。
 
         Returns:
             AI 回复的文本内容。
@@ -84,8 +87,17 @@ class AIChatService:
 
         # 3. 构建 messages 列表
         messages: list[dict[str, str]] = []
+
+        # 拼接 ENV 头部 + system prompt 为一条 system message
+        full_system_prompt = ""
+        if env_header:
+            full_system_prompt += env_header + "\n"
         if self._config.system_prompt:
-            messages.append({"role": "system", "content": self._config.system_prompt})
+            full_system_prompt += self._config.system_prompt
+
+        if full_system_prompt:
+            messages.append({"role": "system", "content": full_system_prompt})
+
         messages.extend(history)
 
         # 4. 调用 API

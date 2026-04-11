@@ -26,6 +26,8 @@ from ybot.models.event import (
 )
 from ybot.models.message import segments_to_text
 from ybot.services.ai_chat import AIChatService
+from ybot.services.bot_info import BotInfoService
+from ybot.services.env_builder import EnvBuilder, MessageFormatter
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger, setup_logger
 
@@ -60,7 +62,13 @@ class Bot:
         self._conv_store = ConversationStore()
         self._ai_chat = AIChatService(config.ai, self._conv_store)
 
+        # 初始化 Bot 信息缓存、ENV 构建器、消息格式化器
+        self._bot_info = BotInfoService(self._ws_server)
+        self._env_builder = EnvBuilder(self._bot_info)
+        self._msg_formatter = MessageFormatter(self._bot_info)
+
         self._running = False
+        self._bot_info_initialized = False
 
     def run(self) -> None:
         """启动 Bot，进入事件循环。
@@ -129,6 +137,16 @@ class Bot:
         if isinstance(event, MessageEvent) and event.user_id == event.self_id:
             return
 
+        # 首次收到事件时，延迟初始化 BotInfoService（需要 OneBot 客户端已连接）
+        if not self._bot_info_initialized:
+            self._bot_info_initialized = True
+            try:
+                await self._bot_info.initialize()
+            except Exception as e:
+                self._logger.warning(
+                    f"BotInfoService 初始化失败（将在后续请求中重试）: {e}"
+                )
+
         match event:
             case GroupMessageEvent() as e:
                 self._log_group_message(e)
@@ -136,7 +154,15 @@ class Bot:
                     text = self._extract_text(e)
                     if text.strip():
                         session_key = f"group_{e.group_id}"
-                        reply = await self._ai_chat.chat(session_key, text)
+                        # 构建 ENV 头部
+                        env_header = await self._env_builder.build_group_env(e.group_id)
+                        # 格式化消息（附带发送者元信息）
+                        formatted_msg = await self._msg_formatter.format_group_message(
+                            e, text
+                        )
+                        reply = await self._ai_chat.chat(
+                            session_key, formatted_msg, env_header
+                        )
                         await self.send_group_msg(e.group_id, reply)
             case PrivateMessageEvent() as e:
                 self._log_private_message(e)
@@ -146,9 +172,19 @@ class Bot:
                     if e.sub_type == "group":
                         temp_group_id = e.raw_data.get("sender", {}).get("group_id", 0)
                         session_key = f"temp_{temp_group_id}_{e.user_id}"
+                        env_header = await self._env_builder.build_temp_env(
+                            e.user_id, temp_group_id
+                        )
                     else:
                         session_key = f"friend_{e.user_id}"
-                    reply = await self._ai_chat.chat(session_key, text)
+                        env_header = await self._env_builder.build_private_env(
+                            e.user_id
+                        )
+                    # 格式化消息
+                    formatted_msg = self._msg_formatter.format_private_message(e, text)
+                    reply = await self._ai_chat.chat(
+                        session_key, formatted_msg, env_header
+                    )
                     await self.send_private_msg(e.user_id, reply)
             case MessageEvent() as e:
                 # 兜底：未知消息类型
