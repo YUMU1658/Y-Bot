@@ -125,6 +125,10 @@ class Bot:
 
         根据事件类型进行日志输出和 AI 回复触发。
         """
+        # 过滤 Bot 自身发送的消息，防止自回复死循环
+        if isinstance(event, MessageEvent) and event.user_id == event.self_id:
+            return
+
         match event:
             case GroupMessageEvent() as e:
                 self._log_group_message(e)
