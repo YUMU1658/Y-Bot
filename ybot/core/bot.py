@@ -131,14 +131,19 @@ class Bot:
                 if self._is_at_me(e):
                     text = self._extract_text(e)
                     if text.strip():
-                        session_key = f"group:{e.group_id}"
+                        session_key = f"group_{e.group_id}"
                         reply = await self._ai_chat.chat(session_key, text)
                         await self.send_group_msg(e.group_id, reply)
             case PrivateMessageEvent() as e:
                 self._log_private_message(e)
                 text = self._extract_text(e)
                 if text.strip():
-                    session_key = f"private:{e.user_id}"
+                    # 临时会话：sub_type 为 "group" 表示从群聊发起的临时私聊
+                    if e.sub_type == "group":
+                        temp_group_id = e.raw_data.get("sender", {}).get("group_id", 0)
+                        session_key = f"temp_{temp_group_id}_{e.user_id}"
+                    else:
+                        session_key = f"friend_{e.user_id}"
                     reply = await self._ai_chat.chat(session_key, text)
                     await self.send_private_msg(e.user_id, reply)
             case MessageEvent() as e:

@@ -71,7 +71,7 @@ class ConversationStore:
         """向指定会话添加一条消息。如果会话不存在则自动创建。
 
         Args:
-            session_key: 会话标识（如 ``private:12345`` 或 ``group:67890``）。
+            session_key: 会话标识（如 ``friend_12345``、``group_67890`` 或 ``temp_11111_22222``）。
             role: 消息角色（``user`` / ``assistant``）。
             content: 消息文本内容。
         """
