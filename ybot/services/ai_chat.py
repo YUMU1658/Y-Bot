@@ -15,6 +15,28 @@ from ybot.utils.logger import get_logger
 
 logger = get_logger("AI")
 
+# 临时默认系统提示词 —— 指导模型使用 <send_msg> 格式
+# TODO: 后续迁移到配置文件或专门的提示词管理模块
+_DEFAULT_SYSTEM_PROMPT = """\
+# 消息发送格式
+
+你必须使用 <send_msg> 标签来发送消息。标签外的内容不会被发送，可用于思考。
+
+格式示例：
+思考过程（不会发送）
+<send_msg>这是要发送的消息</send_msg>
+
+如需发送多条消息：
+<send_msg>第一条消息</send_msg>
+<send_msg>第二条消息</send_msg>
+
+规则：
+- 所有要发送给用户的内容必须放在 <send_msg></send_msg> 标签内
+- 标签外的文字是你的思考过程，不会被发送
+- 可以发送多条消息，系统会按顺序依次发送
+- 每条消息内可以换行
+"""
+
 
 class AIChatService:
     """AI 对话服务。
@@ -88,15 +110,16 @@ class AIChatService:
         # 3. 构建 messages 列表
         messages: list[dict[str, str]] = []
 
-        # 拼接 ENV 头部 + system prompt 为一条 system message
+        # 拼接 ENV 头部 + 临时默认提示词 + system prompt 为一条 system message
         full_system_prompt = ""
         if env_header:
             full_system_prompt += env_header + "\n"
+        # 拼接临时默认系统提示词（消息格式指导）
+        full_system_prompt += _DEFAULT_SYSTEM_PROMPT + "\n"
         if self._config.system_prompt:
             full_system_prompt += self._config.system_prompt
 
-        if full_system_prompt:
-            messages.append({"role": "system", "content": full_system_prompt})
+        messages.append({"role": "system", "content": full_system_prompt})
 
         messages.extend(history)
 

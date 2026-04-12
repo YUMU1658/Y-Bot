@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ybot import __version__
@@ -28,8 +29,12 @@ from ybot.models.message import segments_to_text
 from ybot.services.ai_chat import AIChatService
 from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
+from ybot.services.reply_parser import parse_reply
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger, setup_logger
+
+# 模块级 logger，用于 _send_reply 等非实例方法的日志
+_logger = get_logger("Bot")
 
 
 class Bot:
@@ -163,7 +168,10 @@ class Bot:
                         reply = await self._ai_chat.chat(
                             session_key, formatted_msg, env_header
                         )
-                        await self.send_group_msg(e.group_id, reply)
+                        await self._send_reply(
+                            reply,
+                            send_func=lambda msg: self.send_group_msg(e.group_id, msg),
+                        )
             case PrivateMessageEvent() as e:
                 self._log_private_message(e)
                 text = self._extract_text(e)
@@ -185,7 +193,10 @@ class Bot:
                     reply = await self._ai_chat.chat(
                         session_key, formatted_msg, env_header
                     )
-                    await self.send_private_msg(e.user_id, reply)
+                    await self._send_reply(
+                        reply,
+                        send_func=lambda msg: self.send_private_msg(e.user_id, msg),
+                    )
             case MessageEvent() as e:
                 # 兜底：未知消息类型
                 text = segments_to_text(e.message)
@@ -198,6 +209,38 @@ class Bot:
                 self._log_request_event(e)
             case _:
                 self._logger.debug(f"收到未知事件类型: {event.post_type}")
+
+    # ---- 回复解析与分发 ----
+
+    async def _send_reply(
+        self,
+        reply: str,
+        *,
+        send_func: Callable[[str], Awaitable[None]],
+        interval: float = 1.0,
+    ) -> None:
+        """解析 AI 回复并按序发送消息。
+
+        从 AI 回复中提取 <send_msg> 标签内的消息，按顺序逐条发送，
+        每条消息之间间隔指定时间。
+
+        Args:
+            reply: AI 原始回复文本。
+            send_func: 发送单条消息的异步函数（如 send_group_msg 的偏函数）。
+            interval: 多条消息之间的发送间隔（秒），默认 1.0。
+        """
+        messages = parse_reply(reply)
+
+        if not messages:
+            _logger.warning("AI 回复中未包含 <send_msg> 标签，跳过发送")
+            _logger.debug(f"原始回复: {reply[:200]}")
+            return
+
+        for i, msg in enumerate(messages):
+            await send_func(msg)
+            # 最后一条消息后不需要等待
+            if i < len(messages) - 1:
+                await asyncio.sleep(interval)
 
     # ---- 消息发送 ----
 
