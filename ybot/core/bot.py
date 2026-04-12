@@ -173,12 +173,12 @@ class Bot:
                         temp_group_id = e.raw_data.get("sender", {}).get("group_id", 0)
                         session_key = f"temp_{temp_group_id}_{e.user_id}"
                         env_header = await self._env_builder.build_temp_env(
-                            e.user_id, temp_group_id
+                            e.user_id, temp_group_id, e.sender.nickname
                         )
                     else:
                         session_key = f"friend_{e.user_id}"
                         env_header = await self._env_builder.build_private_env(
-                            e.user_id
+                            e.user_id, e.sender.nickname
                         )
                     # 格式化消息
                     formatted_msg = self._msg_formatter.format_private_message(e, text)

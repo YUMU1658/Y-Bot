@@ -167,18 +167,19 @@ class EnvBuilder:
 
         return f"[ENV]\n{group_line}\n{time_line}\n{self_line}"
 
-    async def build_private_env(self, user_id: int) -> str:
+    async def build_private_env(self, user_id: int, nickname: str) -> str:
         """构建私聊 ENV 头部。
 
         格式::
 
             [ENV]
-            Friend(ID:friend_{user_id})
+            Friend: {对方昵称}(ID:friend_{user_id})
             Time: {YYYY-MM-DD HH:MM} (UTC+8)
             Self: @{Bot昵称}
 
         Args:
             user_id: 对方用户 QQ 号。
+            nickname: 对方的 QQ 昵称。
 
         Returns:
             ENV 头部文本。
@@ -186,30 +187,37 @@ class EnvBuilder:
         login_info = await self._bot_info.get_login_info()
         bot_nickname = login_info.nickname or str(login_info.user_id)
 
+        display_name = nickname or str(user_id)
+
         now = datetime.now(_CST)
         time_line = f"Time: {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)"
 
-        return f"[ENV]\nFriend(ID:friend_{user_id})\n{time_line}\nSelf: @{bot_nickname}"
+        return f"[ENV]\nFriend: {display_name}(ID:friend_{user_id})\n{time_line}\nSelf: @{bot_nickname}"
 
-    async def build_temp_env(self, user_id: int, source_group_id: int) -> str:
+    async def build_temp_env(
+        self, user_id: int, source_group_id: int, nickname: str
+    ) -> str:
         """构建临时会话 ENV 头部。
 
         格式::
 
             [ENV]
-            Temp(ID:temp_{source_group_id}_{user_id}) ← {来源群名}(ID:{source_group_id})
+            Temp: {对方昵称}(ID:temp_{source_group_id}_{user_id}) ← {来源群名}(ID:{source_group_id})
             Time: {YYYY-MM-DD HH:MM} (UTC+8)
             Self: @{Bot昵称}
 
         Args:
             user_id: 对方用户 QQ 号。
             source_group_id: 来源群号。
+            nickname: 对方的 QQ 昵称。
 
         Returns:
             ENV 头部文本。
         """
         login_info = await self._bot_info.get_login_info()
         bot_nickname = login_info.nickname or str(login_info.user_id)
+
+        display_name = nickname or str(user_id)
 
         # 获取来源群名
         group_info = await self._bot_info.get_group_info(source_group_id)
@@ -220,12 +228,12 @@ class EnvBuilder:
 
         if group_name:
             temp_line = (
-                f"Temp(ID:temp_{source_group_id}_{user_id})"
+                f"Temp: {display_name}(ID:temp_{source_group_id}_{user_id})"
                 f" \u2190 {group_name}(ID:{source_group_id})"
             )
         else:
             temp_line = (
-                f"Temp(ID:temp_{source_group_id}_{user_id})"
+                f"Temp: {display_name}(ID:temp_{source_group_id}_{user_id})"
                 f" \u2190 (ID:{source_group_id})"
             )
 
@@ -274,7 +282,7 @@ class MessageFormatter:
 
         输出格式::
 
-            [#{msg_id} {QQ昵称}({QQ号}) → {群昵称} | {等级/头衔/身份} ★友]
+            [#{msg_id} {HH:MM:SS} {QQ昵称}({QQ号}) → {群昵称} | {等级/头衔/身份} ★友]
             {消息内容}
 
         缺省规则：缺什么删什么，连同符号。
@@ -305,7 +313,9 @@ class MessageFormatter:
         title = member.title
 
         # 构建元信息头
-        header_parts = [f"#{msg_id} {nickname}({user_id})"]
+        now = datetime.now(_CST)
+        time_str = now.strftime("%H:%M:%S")
+        header_parts = [f"#{msg_id} {time_str} {nickname}({user_id})"]
 
         # 群昵称
         if card and card != nickname:
@@ -330,7 +340,7 @@ class MessageFormatter:
 
         输出格式::
 
-            [#{msg_id}]
+            [#{msg_id} {HH:MM:SS}]
             {消息内容}
 
         Args:
@@ -340,4 +350,6 @@ class MessageFormatter:
         Returns:
             格式化后的消息文本。
         """
-        return f"[#{event.message_id}]\n{text}"
+        now = datetime.now(_CST)
+        time_str = now.strftime("%H:%M:%S")
+        return f"[#{event.message_id} {time_str}]\n{text}"
