@@ -29,6 +29,7 @@ from ybot.models.message import segments_to_text
 from ybot.services.ai_chat import AIChatService
 from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
+from ybot.services.message_builder import text_to_segments
 from ybot.services.reply_parser import parse_reply
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger, setup_logger
@@ -247,30 +248,38 @@ class Bot:
     async def send_group_msg(self, group_id: int, message: str) -> None:
         """发送群聊消息。
 
+        将文本中的 <at qq="..."/> 标签解析为 OneBot at 消息段，
+        以消息段数组格式发送。
+
         Args:
             group_id: 目标群号。
-            message: 消息文本。
+            message: 消息文本（可能包含 <at> 标签）。
         """
+        segments = text_to_segments(message)
         await self._ws_server.send_api(
             "send_group_msg",
             {
                 "group_id": group_id,
-                "message": message,
+                "message": segments,
             },
         )
 
     async def send_private_msg(self, user_id: int, message: str) -> None:
         """发送私聊消息。
 
+        将文本中的 <at qq="..."/> 标签解析为 OneBot at 消息段，
+        以消息段数组格式发送。
+
         Args:
             user_id: 目标用户 QQ 号。
-            message: 消息文本。
+            message: 消息文本（可能包含 <at> 标签）。
         """
+        segments = text_to_segments(message)
         await self._ws_server.send_api(
             "send_private_msg",
             {
                 "user_id": user_id,
-                "message": message,
+                "message": segments,
             },
         )
 
@@ -294,20 +303,24 @@ class Bot:
 
     @staticmethod
     def _extract_text(event: MessageEvent) -> str:
-        """从消息段中提取纯文本内容。
+        """从消息段中提取文本内容，保留 at 段。
 
-        过滤掉 at 段和其他非文本段，仅保留文本内容并去除首尾空白。
+        保留 text 段和 at 段（转为 <at qq="..."/> 标签），
+        过滤掉其他非文本段，并去除首尾空白。
 
         Args:
             event: 消息事件。
 
         Returns:
-            提取的纯文本。
+            提取的文本（包含 <at> 标签）。
         """
         parts: list[str] = []
         for seg in event.message:
             if seg.type == "text":
                 parts.append(seg.data.get("text", ""))
+            elif seg.type == "at":
+                qq = seg.data.get("qq", "?")
+                parts.append(f'<at qq="{qq}"/>')
         return "".join(parts).strip()
 
     def _log_group_message(self, event: GroupMessageEvent) -> None:

@@ -66,9 +66,7 @@ def segment_to_text(seg: MessageSegment) -> str:
             return f"[表情:{face_id}]"
         case "at":
             qq = seg.data.get("qq", "?")
-            if qq == "all":
-                return "[@全体成员]"
-            return f"[@{qq}]"
+            return f'<at qq="{qq}"/>'
         case "reply":
             msg_id = seg.data.get("id", "?")
             return f"[回复:{msg_id}]"
