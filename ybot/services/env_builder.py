@@ -15,6 +15,7 @@ from ybot.utils.logger import get_logger
 if TYPE_CHECKING:
     from ybot.models.event import GroupMessageEvent, PrivateMessageEvent
     from ybot.services.bot_info import BotInfoService
+    from ybot.storage.chat_log import ChatLogEntry
 
 logger = get_logger("ENV")
 
@@ -353,3 +354,87 @@ class MessageFormatter:
         now = datetime.now(_CST)
         time_str = now.strftime("%H:%M:%S")
         return f"[#{event.message_id} {time_str}]\n{text}"
+
+    @staticmethod
+    def format_chat_log_entry(entry: ChatLogEntry) -> str:
+        """格式化单条聊天记录为带元信息的文本。
+
+        与 ``format_group_message`` 风格一致，但使用 ChatLogEntry 中
+        已预取的元数据，无需异步 API 调用。
+
+        输出格式::
+
+            [#msg_id HH:MM:SS QQ昵称(QQ号) → 群昵称 | 等级/头衔/身份 ★友]
+            消息内容
+
+        Args:
+            entry: 聊天记录条目。
+
+        Returns:
+            格式化后的文本。
+        """
+        # 时间戳转为 HH:MM:SS
+        dt = datetime.fromtimestamp(entry.timestamp, tz=_CST)
+        time_str = dt.strftime("%H:%M:%S")
+
+        header_parts = [
+            f"#{entry.message_id} {time_str} {entry.nickname}({entry.user_id})"
+        ]
+
+        # 群昵称（名片）
+        if entry.card and entry.card != entry.nickname:
+            header_parts.append(f" \u2192 {entry.card}")
+
+        # 身份部分
+        identity = _build_identity_parts(
+            level=entry.level, title=entry.title, role=entry.role
+        )
+        if identity:
+            header_parts.append(f" | {identity}")
+
+        # ★友 标记
+        if entry.is_friend:
+            header_parts.append(" \u2605友")
+
+        header = "[" + "".join(header_parts) + "]"
+        return f"{header}\n{entry.text}"
+
+    @staticmethod
+    def build_context_message(
+        entries: list[ChatLogEntry],
+        new_message: str,
+    ) -> str:
+        """将参考聊天记录和新触发消息组合为完整的 user 消息。
+
+        输出格式::
+
+            --- 以下是近期群聊记录（仅供参考） ---
+            [#1001 14:30:15 张三(12345)]
+            大家好
+            [#1002 14:30:20 李四(67890) → 小李 | 管理员]
+            你好呀
+            --- 以上是近期群聊记录 ---
+
+            [#1004 14:31:00 王五(11111) | 成员]
+            @Y-Bot 你觉得呢？
+
+        如果没有参考记录，则直接返回新消息。
+
+        Args:
+            entries: 参考聊天记录列表（按时间升序）。
+            new_message: 已格式化的新触发消息文本。
+
+        Returns:
+            组合后的完整 user 消息文本。
+        """
+        if not entries:
+            return new_message
+
+        lines: list[str] = ["--- 以下是近期群聊记录（仅供参考） ---"]
+        for entry in entries:
+            lines.append(MessageFormatter.format_chat_log_entry(entry))
+        lines.append("--- 以上是近期群聊记录 ---")
+        lines.append("")  # 空行分隔
+        lines.append(new_message)
+
+        return "\n".join(lines)

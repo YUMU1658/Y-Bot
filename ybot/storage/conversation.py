@@ -24,17 +24,23 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE TABLE IF NOT EXISTS messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id INTEGER NOT NULL,
-    role       TEXT    NOT NULL,
-    content    TEXT    NOT NULL,
-    created_at REAL   NOT NULL,
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       INTEGER NOT NULL,
+    role             TEXT    NOT NULL,
+    content          TEXT    NOT NULL,
+    created_at       REAL   NOT NULL,
+    last_ref_msg_id  INTEGER DEFAULT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session_time
     ON messages (session_id, created_at);
 """
+
+# 迁移 SQL：为已有数据库添加 last_ref_msg_id 列
+_MIGRATION_ADD_LAST_REF_MSG_ID = (
+    "ALTER TABLE messages ADD COLUMN last_ref_msg_id INTEGER DEFAULT NULL"
+)
 
 
 class ConversationStore:
@@ -53,11 +59,21 @@ class ConversationStore:
         """创建数据库连接并建表（IF NOT EXISTS）。
 
         自动创建 data/ 目录（如果不存在）。
+        对已有数据库执行必要的 schema 迁移。
         """
         os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
         await self._db.executescript(_CREATE_TABLES_SQL)
         await self._db.commit()
+
+        # 迁移：为已有数据库添加 last_ref_msg_id 列（如果不存在）
+        try:
+            await self._db.execute(_MIGRATION_ADD_LAST_REF_MSG_ID)
+            await self._db.commit()
+        except Exception:
+            # 列已存在时 SQLite 会抛出 OperationalError，忽略即可
+            pass
+
         logger.info(f"对话存储已初始化: {self._db_path}")
 
     async def close(self) -> None:
@@ -67,13 +83,20 @@ class ConversationStore:
             self._db = None
             logger.info("对话存储已关闭")
 
-    async def add_message(self, session_key: str, role: str, content: str) -> None:
+    async def add_message(
+        self,
+        session_key: str,
+        role: str,
+        content: str,
+        last_ref_msg_id: int | None = None,
+    ) -> None:
         """向指定会话添加一条消息。如果会话不存在则自动创建。
 
         Args:
             session_key: 会话标识（如 ``friend_12345``、``group_67890`` 或 ``temp_11111_22222``）。
             role: 消息角色（``user`` / ``assistant``）。
             content: 消息文本内容。
+            last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（仅 role=user 时有意义）。
         """
         assert self._db is not None, "ConversationStore 未初始化"
 
@@ -101,9 +124,9 @@ class ConversationStore:
 
         # 插入消息
         await self._db.execute(
-            "INSERT INTO messages (session_id, role, content, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (session_id, role, content, now),
+            "INSERT INTO messages (session_id, role, content, created_at, last_ref_msg_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, role, content, now, last_ref_msg_id),
         )
         await self._db.commit()
 
@@ -137,6 +160,33 @@ class ConversationStore:
         rows = await cursor.fetchall()
 
         return [{"role": r[0], "content": r[1]} for r in rows]
+
+    async def get_last_ref_msg_id(self, session_key: str) -> int | None:
+        """获取指定会话最近一条 user 消息的 last_ref_msg_id。
+
+        用于跨轮去重：下一轮构建参考记录时，从该 ID 之后开始取。
+
+        Args:
+            session_key: 会话标识。
+
+        Returns:
+            最近一条 user 消息的 last_ref_msg_id，如果不存在则返回 None。
+        """
+        assert self._db is not None, "ConversationStore 未初始化"
+
+        cursor = await self._db.execute(
+            "SELECT m.last_ref_msg_id "
+            "FROM messages m "
+            "JOIN sessions s ON m.session_id = s.id "
+            "WHERE s.session_key = ? AND m.role = 'user' "
+            "ORDER BY m.created_at DESC "
+            "LIMIT 1",
+            (session_key,),
+        )
+        row = await cursor.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
 
     async def clear_session(self, session_key: str) -> None:
         """清空指定会话的所有消息（保留 session 记录）。

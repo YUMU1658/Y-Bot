@@ -74,7 +74,11 @@ class AIChatService:
             logger.info("AI 服务已关闭")
 
     async def chat(
-        self, session_key: str, user_message: str, env_header: str = ""
+        self,
+        session_key: str,
+        user_message: str,
+        env_header: str = "",
+        last_ref_msg_id: int | None = None,
     ) -> str:
         """发送多轮对话请求，返回 AI 回复文本。
 
@@ -90,6 +94,7 @@ class AIChatService:
             session_key: 会话标识（如 ``friend_12345``、``group_67890`` 或 ``temp_11111_22222``）。
             user_message: 用户消息文本（已包含元信息格式化）。
             env_header: ENV 头部文本（可选），拼接到 system prompt 前面。
+            last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（用于跨轮去重）。
 
         Returns:
             AI 回复的文本内容。
@@ -103,7 +108,9 @@ class AIChatService:
             return "[未配置 API 密钥]"
 
         # 1. 存入用户消息
-        await self._store.add_message(session_key, "user", user_message)
+        await self._store.add_message(
+            session_key, "user", user_message, last_ref_msg_id=last_ref_msg_id
+        )
 
         # 2. 获取历史消息
         history = await self._store.get_history(

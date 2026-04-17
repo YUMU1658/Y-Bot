@@ -31,6 +31,7 @@ from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
 from ybot.services.message_builder import text_to_segments
 from ybot.services.reply_parser import parse_reply
+from ybot.storage.chat_log import ChatLogEntry, GroupChatLog
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger, setup_logger
 
@@ -72,6 +73,9 @@ class Bot:
         self._bot_info = BotInfoService(self._ws_server)
         self._env_builder = EnvBuilder(self._bot_info)
         self._msg_formatter = MessageFormatter(self._bot_info)
+
+        # 初始化群聊消息日志缓冲区
+        self._chat_log = GroupChatLog(buffer_size=config.ai.context_buffer)
 
         self._running = False
         self._bot_info_initialized = False
@@ -140,7 +144,10 @@ class Bot:
         根据事件类型进行日志输出和 AI 回复触发。
         """
         # 过滤 Bot 自身发送的消息，防止自回复死循环
+        # 但仍收集 bot 自身的群消息到上下文缓冲区
         if isinstance(event, MessageEvent) and event.user_id == event.self_id:
+            if isinstance(event, GroupMessageEvent):
+                await self._collect_group_message(event, is_bot=True)
             return
 
         # 首次收到事件时，延迟初始化 BotInfoService（需要 OneBot 客户端已连接）
@@ -156,18 +163,30 @@ class Bot:
         match event:
             case GroupMessageEvent() as e:
                 self._log_group_message(e)
+                # 收集所有群消息到上下文缓冲区（包括非 @bot 的）
+                await self._collect_group_message(e, is_bot=False)
                 if self._is_at_me(e):
                     text = self._extract_text(e)
                     if text.strip():
                         session_key = f"group_{e.group_id}"
                         # 构建 ENV 头部
                         env_header = await self._env_builder.build_group_env(e.group_id)
-                        # 格式化消息（附带发送者元信息）
+                        # 格式化当前触发消息（附带发送者元信息）
                         formatted_msg = await self._msg_formatter.format_group_message(
                             e, text
                         )
+                        # 构建带参考聊天记录的 user 消息
+                        (
+                            context_msg,
+                            last_ref_id,
+                        ) = await self._build_context_user_message(
+                            e, formatted_msg, session_key
+                        )
                         reply = await self._ai_chat.chat(
-                            session_key, formatted_msg, env_header
+                            session_key,
+                            context_msg,
+                            env_header,
+                            last_ref_msg_id=last_ref_id,
                         )
                         await self._send_reply(
                             reply,
@@ -284,6 +303,81 @@ class Bot:
         )
 
     # ---- 辅助方法 ----
+
+    async def _collect_group_message(
+        self, event: GroupMessageEvent, *, is_bot: bool
+    ) -> None:
+        """收集群消息到上下文缓冲区。
+
+        对所有群消息（包括非 @bot 的和 bot 自身的）调用，
+        将消息元信息和文本内容存入 GroupChatLog。
+
+        使用 event.sender 中的数据，避免为每条消息调用 API。
+
+        Args:
+            event: 群聊消息事件。
+            is_bot: 是否为 bot 自身发送的消息。
+        """
+        text = self._extract_text(event)
+        if not text.strip():
+            return
+
+        entry = ChatLogEntry(
+            message_id=event.message_id,
+            group_id=event.group_id,
+            user_id=event.user_id,
+            nickname=event.sender.nickname or str(event.user_id),
+            card=event.sender.card or "",
+            role=event.sender.role or "",
+            level="",  # event.sender 不含 level，避免 API 调用
+            title="",  # event.sender 不含 title，避免 API 调用
+            is_friend=False,  # 避免 API 调用，非触发消息不需要精确值
+            timestamp=event.time,
+            text=text,
+            is_bot=is_bot,
+        )
+        self._chat_log.add(entry)
+
+    async def _build_context_user_message(
+        self,
+        event: GroupMessageEvent,
+        formatted_msg: str,
+        session_key: str,
+    ) -> tuple[str, int | None]:
+        """构建带参考聊天记录的 user 消息。
+
+        从 GroupChatLog 获取参考聊天记录（去重已提供过的），
+        与当前触发消息组合为完整的 user 消息。
+
+        Args:
+            event: 当前触发的群聊消息事件。
+            formatted_msg: 已格式化的当前触发消息文本。
+            session_key: 会话标识。
+
+        Returns:
+            (完整的 user 消息文本, 本轮参考记录中最新一条的 message_id)。
+        """
+        context_limit = self.config.ai.context_limit
+
+        # 获取上一轮的去重边界
+        prev_last_ref_id = await self._conv_store.get_last_ref_msg_id(session_key)
+
+        # 获取参考聊天记录（排除当前触发消息本身）
+        ref_entries = self._chat_log.get_between(
+            group_id=event.group_id,
+            after_msg_id=prev_last_ref_id,
+            before_msg_id=event.message_id,
+            limit=context_limit,
+        )
+
+        # 记录本轮参考记录中最新一条的 message_id
+        last_ref_id: int | None = None
+        if ref_entries:
+            last_ref_id = ref_entries[-1].message_id
+
+        # 组合参考记录 + 新消息
+        context_msg = MessageFormatter.build_context_message(ref_entries, formatted_msg)
+        return context_msg, last_ref_id
 
     @staticmethod
     def _is_at_me(event: GroupMessageEvent) -> bool:

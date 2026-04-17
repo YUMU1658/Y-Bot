@@ -28,6 +28,8 @@ api_key = ""                               # API 密钥
 model = "gpt-4o-mini"                      # 模型 ID
 system_prompt = ""                         # 系统提示词（可选，留空则不发送）
 max_history = 20                           # 每次请求携带的最大历史消息数
+context_limit = 20                         # 每次提供的参考聊天记录最大条数
+context_buffer = 100                       # 内存中每个群保留的聊天记录缓冲区大小
 """
 
 
@@ -55,6 +57,8 @@ class AIConfig:
     model: str = "gpt-4o-mini"
     system_prompt: str = ""
     max_history: int = 20
+    context_limit: int = 20  # 每次提供的参考聊天记录最大条数
+    context_buffer: int = 100  # 内存中每个群保留的聊天记录缓冲区大小
 
 
 @dataclass
@@ -107,6 +111,8 @@ class Config:
             model=ai_data.get("model", "gpt-4o-mini"),
             system_prompt=ai_data.get("system_prompt", ""),
             max_history=ai_data.get("max_history", 20),
+            context_limit=ai_data.get("context_limit", 20),
+            context_buffer=ai_data.get("context_buffer", 100),
         )
 
         return cls(server=server, bot=bot, ai=ai)
