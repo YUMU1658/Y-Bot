@@ -189,11 +189,14 @@ class Bot:
                         ) = await self._build_context_user_message(
                             e, formatted_msg, session_key
                         )
+                        # 提取当前触发消息中的图片 URL
+                        image_urls = self._extract_image_urls(e)
                         reply = await self._ai_chat.chat(
                             session_key,
                             context_msg,
                             env_header,
                             last_ref_msg_id=last_ref_id,
+                            image_urls=image_urls or None,
                         )
                         await self._send_reply(
                             reply,
@@ -219,8 +222,13 @@ class Bot:
                         )
                     # 格式化消息
                     formatted_msg = self._msg_formatter.format_private_message(e, text)
+                    # 提取当前触发消息中的图片 URL
+                    image_urls = self._extract_image_urls(e)
                     reply = await self._ai_chat.chat(
-                        session_key, formatted_msg, env_header
+                        session_key,
+                        formatted_msg,
+                        env_header,
+                        image_urls=image_urls or None,
                     )
                     await self._send_reply(
                         reply,
@@ -430,6 +438,32 @@ class Bot:
             包含所有消息段信息的内容文本。
         """
         return segments_to_content(event.message).strip()
+
+    @staticmethod
+    def _extract_image_urls(event: MessageEvent) -> list[str]:
+        """从消息段中提取图片 URL 列表。
+
+        遍历消息段，找到 ``type="image"`` 且 ``sub_type != 1``（排除自定义表情）
+        的段，提取其 ``url`` 字段。
+
+        Args:
+            event: 消息事件。
+
+        Returns:
+            图片 URL 列表（已过滤空值）。
+        """
+        urls: list[str] = []
+        for seg in event.message:
+            if seg.type != "image":
+                continue
+            # sub_type=1 表示自定义表情（小表情 GIF），不适合 vision 分析
+            sub_type = seg.data.get("sub_type")
+            if sub_type is not None and str(sub_type) == "1":
+                continue
+            url = seg.data.get("url")
+            if url:
+                urls.append(url)
+        return urls
 
     # 引用回复内容截断上限（字符数）
     _REPLY_CONTENT_MAX_CHARS = 80

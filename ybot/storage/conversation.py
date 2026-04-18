@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
+from typing import Any
 
 import aiosqlite
 
@@ -28,6 +30,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id       INTEGER NOT NULL,
     role             TEXT    NOT NULL,
     content          TEXT    NOT NULL,
+    content_type     TEXT    NOT NULL DEFAULT 'text',
     created_at       REAL   NOT NULL,
     last_ref_msg_id  INTEGER DEFAULT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(id)
@@ -40,6 +43,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_time
 # 迁移 SQL：为已有数据库添加 last_ref_msg_id 列
 _MIGRATION_ADD_LAST_REF_MSG_ID = (
     "ALTER TABLE messages ADD COLUMN last_ref_msg_id INTEGER DEFAULT NULL"
+)
+
+# 迁移 SQL：为已有数据库添加 content_type 列
+_MIGRATION_ADD_CONTENT_TYPE = (
+    "ALTER TABLE messages ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"
 )
 
 
@@ -74,6 +82,13 @@ class ConversationStore:
             # 列已存在时 SQLite 会抛出 OperationalError，忽略即可
             pass
 
+        # 迁移：为已有数据库添加 content_type 列（如果不存在）
+        try:
+            await self._db.execute(_MIGRATION_ADD_CONTENT_TYPE)
+            await self._db.commit()
+        except Exception:
+            pass
+
         logger.info(f"对话存储已初始化: {self._db_path}")
 
     async def close(self) -> None:
@@ -89,14 +104,16 @@ class ConversationStore:
         role: str,
         content: str,
         last_ref_msg_id: int | None = None,
+        content_type: str = "text",
     ) -> None:
         """向指定会话添加一条消息。如果会话不存在则自动创建。
 
         Args:
             session_key: 会话标识（如 ``friend_12345``、``group_67890`` 或 ``temp_11111_22222``）。
             role: 消息角色（``user`` / ``assistant``）。
-            content: 消息文本内容。
+            content: 消息文本内容。当 content_type 为 ``multimodal`` 时，应为 JSON 字符串。
             last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（仅 role=user 时有意义）。
+            content_type: 内容类型（``text`` 或 ``multimodal``）。
         """
         assert self._db is not None, "ConversationStore 未初始化"
 
@@ -124,16 +141,20 @@ class ConversationStore:
 
         # 插入消息
         await self._db.execute(
-            "INSERT INTO messages (session_id, role, content, created_at, last_ref_msg_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, role, content, now, last_ref_msg_id),
+            "INSERT INTO messages (session_id, role, content, content_type, created_at, last_ref_msg_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, role, content, content_type, now, last_ref_msg_id),
         )
         await self._db.commit()
 
     async def get_history(
         self, session_key: str, limit: int = 20
-    ) -> list[dict[str, str]]:
+    ) -> list[dict[str, Any]]:
         """获取指定会话的最近 N 条消息。
+
+        对于 ``content_type="multimodal"`` 的消息，会将 content 从 JSON 字符串
+        解析为列表，并将其中的 ``image_url`` 元素替换为文本占位符 ``[图片(历史)]``，
+        避免回放过期 URL 和浪费 token。
 
         Args:
             session_key: 会话标识。
@@ -141,14 +162,14 @@ class ConversationStore:
 
         Returns:
             按时间升序排列的消息列表，每条为
-            ``{"role": "user"|"assistant", "content": "..."}``。
+            ``{"role": "user"|"assistant", "content": "..." | [...]}``。
         """
         assert self._db is not None, "ConversationStore 未初始化"
 
         # 子查询取最近 N 条（DESC），外层再按时间正序排列
         cursor = await self._db.execute(
-            "SELECT role, content FROM ("
-            "  SELECT m.role, m.content, m.created_at "
+            "SELECT role, content, content_type FROM ("
+            "  SELECT m.role, m.content, m.content_type, m.created_at "
             "  FROM messages m "
             "  JOIN sessions s ON m.session_id = s.id "
             "  WHERE s.session_key = ? "
@@ -159,7 +180,26 @@ class ConversationStore:
         )
         rows = await cursor.fetchall()
 
-        return [{"role": r[0], "content": r[1]} for r in rows]
+        result: list[dict[str, Any]] = []
+        for r in rows:
+            role, content, content_type = r[0], r[1], r[2]
+            if content_type == "multimodal":
+                try:
+                    content_list = json.loads(content)
+                    # 将 image_url 元素替换为文本占位符
+                    sanitized: list[dict[str, Any]] = []
+                    for item in content_list:
+                        if isinstance(item, dict) and item.get("type") == "image_url":
+                            sanitized.append({"type": "text", "text": "[图片(历史)]"})
+                        else:
+                            sanitized.append(item)
+                    result.append({"role": role, "content": sanitized})
+                except (json.JSONDecodeError, TypeError):
+                    # JSON 解析失败时降级为纯文本
+                    result.append({"role": role, "content": content})
+            else:
+                result.append({"role": role, "content": content})
+        return result
 
     async def get_last_ref_msg_id(self, session_key: str) -> int | None:
         """获取指定会话最近一条 user 消息的 last_ref_msg_id。

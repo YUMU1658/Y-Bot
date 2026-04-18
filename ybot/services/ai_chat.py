@@ -7,6 +7,9 @@
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import aiohttp
 
 from ybot.core.config import AIConfig
@@ -79,6 +82,7 @@ class AIChatService:
         user_message: str,
         env_header: str = "",
         last_ref_msg_id: int | None = None,
+        image_urls: list[str] | None = None,
     ) -> str:
         """发送多轮对话请求，返回 AI 回复文本。
 
@@ -95,6 +99,7 @@ class AIChatService:
             user_message: 用户消息文本（已包含元信息格式化）。
             env_header: ENV 头部文本（可选），拼接到 system prompt 前面。
             last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（用于跨轮去重）。
+            image_urls: 当前触发消息中的图片 URL 列表（可选）。仅在 enable_vision=True 时生效。
 
         Returns:
             AI 回复的文本内容。
@@ -107,10 +112,33 @@ class AIChatService:
             logger.warning("未配置 API 密钥，跳过 AI 调用")
             return "[未配置 API 密钥]"
 
-        # 1. 存入用户消息
-        await self._store.add_message(
-            session_key, "user", user_message, last_ref_msg_id=last_ref_msg_id
+        # 1. 判断是否构建 multimodal content
+        use_vision = (
+            self._config.enable_vision
+            and image_urls is not None
+            and len(image_urls) > 0
         )
+
+        if use_vision:
+            # 构建 OpenAI Vision 格式的 multimodal content 数组
+            content_array: list[dict[str, Any]] = [
+                {"type": "text", "text": user_message}
+            ]
+            for url in image_urls:
+                content_array.append({"type": "image_url", "image_url": {"url": url}})
+            # 存入数据库时序列化为 JSON 字符串
+            await self._store.add_message(
+                session_key,
+                "user",
+                json.dumps(content_array, ensure_ascii=False),
+                last_ref_msg_id=last_ref_msg_id,
+                content_type="multimodal",
+            )
+        else:
+            # 纯文本，保持原有行为
+            await self._store.add_message(
+                session_key, "user", user_message, last_ref_msg_id=last_ref_msg_id
+            )
 
         # 2. 获取历史消息
         history = await self._store.get_history(
@@ -118,7 +146,7 @@ class AIChatService:
         )
 
         # 3. 构建 messages 列表
-        messages: list[dict[str, str]] = []
+        messages: list[dict[str, Any]] = []
 
         # 拼接 ENV 头部 + 临时默认提示词 + system prompt 为一条 system message
         full_system_prompt = ""
@@ -132,6 +160,15 @@ class AIChatService:
         messages.append({"role": "system", "content": full_system_prompt})
 
         messages.extend(history)
+
+        # 当前轮使用 vision 时，history 中最后一条 user 消息的图片已被替换为占位符，
+        # 需要还原为原始 multimodal content（包含真实 image_url）
+        if use_vision:
+            # 从后往前找到最后一条 user 消息并替换其 content
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    messages[i] = {"role": "user", "content": content_array}
+                    break
 
         # 4. 调用 API
         url = f"{self._config.api_base.rstrip('/')}/chat/completions"
