@@ -13,7 +13,13 @@ from dataclasses import dataclass
 
 @dataclass
 class ChatLogEntry:
-    """单条聊天记录。"""
+    """单条聊天记录。
+
+    Attributes:
+        text: 消息内容表示。包含纯文本以及富媒体占位标记
+            （如 ``[图片 file:xxx]``、``[语音]``、``[商城表情:"可爱"]`` 等），
+            由 ``segments_to_content()`` 生成。
+    """
 
     message_id: int  # OneBot message_id（去重依据）
     group_id: int
@@ -25,7 +31,7 @@ class ChatLogEntry:
     title: str  # 专属头衔
     is_friend: bool
     timestamp: float  # Unix 时间戳（来自 event.time）
-    text: str  # 提取的文本内容
+    text: str  # 消息内容表示（含富媒体占位标记）
     is_bot: bool  # 是否为 bot 自身发送的消息
 
 

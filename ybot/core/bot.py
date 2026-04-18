@@ -25,7 +25,7 @@ from ybot.models.event import (
     RequestEvent,
     parse_event,
 )
-from ybot.models.message import segments_to_text
+from ybot.models.message import segments_to_content, segments_to_text
 from ybot.services.ai_chat import AIChatService
 from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
@@ -166,7 +166,7 @@ class Bot:
                 # 收集所有群消息到上下文缓冲区（包括非 @bot 的）
                 await self._collect_group_message(e, is_bot=False)
                 if self._is_at_me(e):
-                    text = self._extract_text(e)
+                    text = self._extract_content(e)
                     if text.strip():
                         session_key = f"group_{e.group_id}"
                         # 构建 ENV 头部
@@ -194,7 +194,7 @@ class Bot:
                         )
             case PrivateMessageEvent() as e:
                 self._log_private_message(e)
-                text = self._extract_text(e)
+                text = self._extract_content(e)
                 if text.strip():
                     # 临时会话：sub_type 为 "group" 表示从群聊发起的临时私聊
                     if e.sub_type == "group":
@@ -310,7 +310,10 @@ class Bot:
         """收集群消息到上下文缓冲区。
 
         对所有群消息（包括非 @bot 的和 bot 自身的）调用，
-        将消息元信息和文本内容存入 GroupChatLog。
+        将消息元信息和内容表示存入 GroupChatLog。
+
+        内容表示包含所有消息段的信息（文本、图片占位标记、
+        表情标记等），不再仅限于纯文本。
 
         使用 event.sender 中的数据，避免为每条消息调用 API。
 
@@ -318,7 +321,7 @@ class Bot:
             event: 群聊消息事件。
             is_bot: 是否为 bot 自身发送的消息。
         """
-        text = self._extract_text(event)
+        text = self._extract_content(event)
         if not text.strip():
             return
 
@@ -396,26 +399,24 @@ class Bot:
         return False
 
     @staticmethod
-    def _extract_text(event: MessageEvent) -> str:
-        """从消息段中提取文本内容，保留 at 段。
+    def _extract_content(event: MessageEvent) -> str:
+        """从消息段中提取完整内容表示。
 
-        保留 text 段和 at 段（转为 <at qq="..."/> 标签），
-        过滤掉其他非文本段，并去除首尾空白。
+        保留所有消息段的信息：
+        - text → 原文
+        - at → <at qq="..."/>
+        - 其他类型 → 结构化占位标记（如 [图片 file:xxx]）
+
+        与旧版 _extract_text 的区别：不再丢弃非 text/at 段，
+        而是通过 segment_to_content 将它们转为 LLM 可感知的标记。
 
         Args:
             event: 消息事件。
 
         Returns:
-            提取的文本（包含 <at> 标签）。
+            包含所有消息段信息的内容文本。
         """
-        parts: list[str] = []
-        for seg in event.message:
-            if seg.type == "text":
-                parts.append(seg.data.get("text", ""))
-            elif seg.type == "at":
-                qq = seg.data.get("qq", "?")
-                parts.append(f'<at qq="{qq}"/>')
-        return "".join(parts).strip()
+        return segments_to_content(event.message).strip()
 
     def _log_group_message(self, event: GroupMessageEvent) -> None:
         """格式化输出群聊消息日志。"""
