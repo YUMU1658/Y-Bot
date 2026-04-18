@@ -10,6 +10,7 @@ import asyncio
 import signal
 import sys
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ybot import __version__
@@ -25,7 +26,11 @@ from ybot.models.event import (
     RequestEvent,
     parse_event,
 )
-from ybot.models.message import segments_to_content, segments_to_text
+from ybot.models.message import (
+    parse_message,
+    segments_to_content,
+    segments_to_text,
+)
 from ybot.services.ai_chat import AIChatService
 from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
@@ -167,6 +172,8 @@ class Bot:
                 await self._collect_group_message(e, is_bot=False)
                 if self._is_at_me(e):
                     text = self._extract_content(e)
+                    # 解析引用/回复消息的详情
+                    text = await self._resolve_reply(text, e)
                     if text.strip():
                         session_key = f"group_{e.group_id}"
                         # 构建 ENV 头部
@@ -195,6 +202,8 @@ class Bot:
             case PrivateMessageEvent() as e:
                 self._log_private_message(e)
                 text = self._extract_content(e)
+                # 解析引用/回复消息的详情
+                text = await self._resolve_reply(text, e)
                 if text.strip():
                     # 临时会话：sub_type 为 "group" 表示从群聊发起的临时私聊
                     if e.sub_type == "group":
@@ -314,6 +323,7 @@ class Bot:
 
         内容表示包含所有消息段的信息（文本、图片占位标记、
         表情标记等），不再仅限于纯文本。
+        如果消息包含引用/回复段，会通过 API 解析被引用消息的详情。
 
         使用 event.sender 中的数据，避免为每条消息调用 API。
 
@@ -324,6 +334,9 @@ class Bot:
         text = self._extract_content(event)
         if not text.strip():
             return
+
+        # 解析引用/回复消息的详情
+        text = await self._resolve_reply(text, event)
 
         entry = ChatLogEntry(
             message_id=event.message_id,
@@ -417,6 +430,98 @@ class Bot:
             包含所有消息段信息的内容文本。
         """
         return segments_to_content(event.message).strip()
+
+    # 引用回复内容截断上限（字符数）
+    _REPLY_CONTENT_MAX_CHARS = 80
+
+    # 北京时间 UTC+8
+    _CST = timezone(timedelta(hours=8))
+
+    async def _resolve_reply(self, content: str, event: MessageEvent) -> str:
+        """解析消息中的回复段，将占位符替换为被引用消息的详情。
+
+        遍历消息段查找 reply 类型，通过 get_msg API 获取被引用消息，
+        将 ``[回复:#msg_id]`` 占位符替换为包含发送者、时间、内容的完整引用。
+
+        成功格式::
+
+            [回复:#1234 ← 张三(12345) 14:30:15 | "原始消息内容..."]
+
+        消息已撤回或不可用::
+
+            [回复:#1234 ← 消息已撤回或不可用]
+
+        Args:
+            content: 已提取的内容文本（包含 ``[回复:#id]`` 占位符）。
+            event: 消息事件（用于遍历消息段获取 reply id）。
+
+        Returns:
+            替换占位符后的内容文本。如果没有 reply 段则原样返回。
+        """
+        for seg in event.message:
+            if seg.type != "reply":
+                continue
+
+            reply_msg_id = seg.data.get("id")
+            if not reply_msg_id:
+                continue
+
+            placeholder = f"[回复:#{reply_msg_id}]"
+            if placeholder not in content:
+                continue
+
+            resolved = await self._fetch_reply_detail(reply_msg_id)
+            content = content.replace(placeholder, resolved, 1)
+
+        return content
+
+    async def _fetch_reply_detail(self, msg_id: str) -> str:
+        """通过 get_msg API 获取被引用消息的详情并格式化。
+
+        Args:
+            msg_id: 被引用消息的 message_id。
+
+        Returns:
+            格式化后的引用标记文本。
+        """
+        try:
+            data = await self._ws_server.call_api(
+                "get_msg", {"message_id": int(msg_id)}, timeout=5.0
+            )
+        except Exception as e:
+            self._logger.debug(f"获取引用消息失败 (msg_id={msg_id}): {e}")
+            return f"[回复:#{msg_id} ← 消息已撤回或不可用]"
+
+        # 提取发送者信息
+        sender = data.get("sender", {})
+        nickname = sender.get("nickname", "?")
+        user_id = data.get("user_id", "?")
+
+        # 时间戳格式化
+        timestamp = data.get("time", 0)
+        try:
+            dt = datetime.fromtimestamp(timestamp, tz=self._CST)
+            time_str = dt.strftime("%H:%M:%S")
+        except (OSError, ValueError):
+            time_str = "??:??:??"
+
+        # 解析被引用消息的内容（使用 segments_to_content 保持格式统一）
+        raw_message_data = data.get("message", [])
+        if isinstance(raw_message_data, list) and raw_message_data:
+            reply_segments = parse_message(raw_message_data)
+            reply_content = segments_to_content(reply_segments)
+        else:
+            # 降级：使用 raw_message 字段
+            reply_content = data.get("raw_message", "")
+
+        # 截断
+        max_chars = self._REPLY_CONTENT_MAX_CHARS
+        if len(reply_content) > max_chars:
+            reply_content = reply_content[:max_chars] + "..."
+
+        return (
+            f'[回复:#{msg_id} ← {nickname}({user_id}) {time_str} | "{reply_content}"]'
+        )
 
     def _log_group_message(self, event: GroupMessageEvent) -> None:
         """格式化输出群聊消息日志。"""
