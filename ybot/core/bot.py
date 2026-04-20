@@ -15,6 +15,7 @@ from typing import Any
 
 from ybot import __version__
 from ybot.core.config import Config
+from ybot.core.request_queue import PendingRequest, QueuedMessage, RequestQueue
 from ybot.core.ws_server import WebSocketServer
 from ybot.models.event import (
     Event,
@@ -82,6 +83,9 @@ class Bot:
         # 初始化群聊消息日志缓冲区
         self._chat_log = GroupChatLog(buffer_size=config.ai.context_buffer)
 
+        # 初始化防抖 + 单线程请求队列
+        self._request_queue = RequestQueue(debounce_seconds=1.0)
+
         self._running = False
         self._bot_info_initialized = False
 
@@ -110,6 +114,7 @@ class Bot:
         # 启动 AI 服务（需在事件循环中创建 aiohttp 会话）
         await self._conv_store.initialize()
         await self._ai_chat.start()
+        await self._request_queue.start()
         await self._ws_server.start()
 
         self._logger.info(f"Y-BOT v{__version__} 已就绪，等待 OneBot 客户端连接...")
@@ -131,6 +136,7 @@ class Bot:
         """优雅关闭 Bot。"""
         self._logger.info("正在关闭 Y-BOT...")
         await self._ws_server.stop()
+        await self._request_queue.stop()
         await self._ai_chat.stop()
         await self._conv_store.close()
         self._logger.info("Y-BOT 已关闭")
@@ -191,16 +197,21 @@ class Bot:
                         )
                         # 提取当前触发消息中的图片 URL
                         image_urls = self._extract_image_urls(e)
-                        reply = await self._ai_chat.chat(
-                            session_key,
-                            context_msg,
-                            env_header,
-                            last_ref_msg_id=last_ref_id,
-                            image_urls=image_urls or None,
+                        # 提交到防抖队列（不再直接 await AI 调用）
+                        queued = QueuedMessage(
+                            formatted_msg=formatted_msg,
+                            context_data={
+                                "type": "group",
+                                "session_key": session_key,
+                                "env_header": env_header,
+                                "context_msg": context_msg,
+                                "last_ref_id": last_ref_id,
+                                "image_urls": image_urls,
+                                "group_id": e.group_id,
+                            },
                         )
-                        await self._send_reply(
-                            reply,
-                            send_func=lambda msg: self.send_group_msg(e.group_id, msg),
+                        self._request_queue.submit(
+                            session_key, queued, self._process_ai_request
                         )
             case PrivateMessageEvent() as e:
                 self._log_private_message(e)
@@ -224,15 +235,19 @@ class Bot:
                     formatted_msg = self._msg_formatter.format_private_message(e, text)
                     # 提取当前触发消息中的图片 URL
                     image_urls = self._extract_image_urls(e)
-                    reply = await self._ai_chat.chat(
-                        session_key,
-                        formatted_msg,
-                        env_header,
-                        image_urls=image_urls or None,
+                    # 提交到防抖队列（不再直接 await AI 调用）
+                    queued = QueuedMessage(
+                        formatted_msg=formatted_msg,
+                        context_data={
+                            "type": "private",
+                            "session_key": session_key,
+                            "env_header": env_header,
+                            "image_urls": image_urls,
+                            "user_id": e.user_id,
+                        },
                     )
-                    await self._send_reply(
-                        reply,
-                        send_func=lambda msg: self.send_private_msg(e.user_id, msg),
+                    self._request_queue.submit(
+                        session_key, queued, self._process_ai_request
                     )
             case MessageEvent() as e:
                 # 兜底：未知消息类型
@@ -280,6 +295,76 @@ class Bot:
             # 最后一条消息后不需要等待
             if i < len(messages) - 1:
                 await asyncio.sleep(interval)
+
+    # ---- 请求队列回调 ----
+
+    async def _process_ai_request(self, request: PendingRequest) -> None:
+        """处理一个（可能已合并的）AI 请求。
+
+        由 RequestQueue 的 worker 协程调用。根据消息类型（群聊/私聊）
+        和消息数量（单条/多条合并）构建最终的 user message 并调用 LLM。
+
+        Args:
+            request: 包含一条或多条合并消息的待处理请求。
+        """
+        # 使用最后一条消息的上下文数据（最新状态）
+        last_msg = request.messages[-1]
+        data = last_msg.context_data
+        session_key = data["session_key"]
+        env_header = data["env_header"]
+        msg_type = data["type"]
+
+        # 合并所有消息的图片 URL
+        all_image_urls: list[str] = []
+        for m in request.messages:
+            urls = m.context_data.get("image_urls", [])
+            if urls:
+                all_image_urls.extend(urls)
+
+        # 构建发送函数
+        if msg_type == "group":
+            group_id = data["group_id"]
+            send_func = lambda msg, gid=group_id: self.send_group_msg(gid, msg)
+        else:
+            user_id = data["user_id"]
+            send_func = lambda msg, uid=user_id: self.send_private_msg(uid, msg)
+
+        if len(request.messages) == 1:
+            # ---- 单条消息：直接使用已预处理的数据 ----
+            if msg_type == "group":
+                user_message = data["context_msg"]
+                last_ref_id = data["last_ref_id"]
+            else:
+                # 私聊没有 context_msg / last_ref_id
+                user_message = last_msg.formatted_msg
+                last_ref_id = None
+        else:
+            # ---- 多条消息合并 ----
+            if msg_type == "group":
+                # 第一条消息的 context_msg 包含完整的聊天记录引用 + 第一条格式化消息
+                # 后续消息只需追加其 formatted_msg
+                first_data = request.messages[0].context_data
+                parts = [first_data["context_msg"]]
+                for m in request.messages[1:]:
+                    parts.append(m.formatted_msg)
+                user_message = "\n".join(parts)
+                # last_ref_id 使用最后一条消息的值
+                last_ref_id = data["last_ref_id"]
+            else:
+                # 私聊：拼接所有 formatted_msg
+                parts = [m.formatted_msg for m in request.messages]
+                user_message = "\n".join(parts)
+                last_ref_id = None
+
+        # 调用 LLM
+        reply = await self._ai_chat.chat(
+            session_key,
+            user_message,
+            env_header,
+            last_ref_msg_id=last_ref_id,
+            image_urls=all_image_urls or None,
+        )
+        await self._send_reply(reply, send_func=send_func)
 
     # ---- 消息发送 ----
 
