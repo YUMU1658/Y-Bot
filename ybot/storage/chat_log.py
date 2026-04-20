@@ -33,6 +33,7 @@ class ChatLogEntry:
     timestamp: float  # Unix 时间戳（来自 event.time）
     text: str  # 消息内容表示（含富媒体占位标记）
     is_bot: bool  # 是否为 bot 自身发送的消息
+    recalled: bool = False  # 是否已被撤回
 
 
 class GroupChatLog:
@@ -111,3 +112,33 @@ class GroupChatLog:
 
         result = entries[start_idx:end_idx]
         return result[-limit:] if len(result) > limit else result
+
+    def mark_recalled(self, message_id: int) -> None:
+        """将指定消息标记为已撤回。
+
+        遍历所有群的缓冲区，找到对应 message_id 的条目并标记。
+        message_id 全局唯一，找到后立即返回。
+
+        Args:
+            message_id: 被撤回消息的 message_id。
+        """
+        for entries in self._logs.values():
+            for entry in entries:
+                if entry.message_id == message_id:
+                    entry.recalled = True
+                    return
+
+    def is_recalled(self, message_id: int) -> bool:
+        """查询指定消息是否已被标记为撤回。
+
+        Args:
+            message_id: 消息的 message_id。
+
+        Returns:
+            如果消息在缓冲区中且已标记为撤回则返回 True，否则返回 False。
+        """
+        for entries in self._logs.values():
+            for entry in entries:
+                if entry.message_id == message_id:
+                    return entry.recalled
+        return False

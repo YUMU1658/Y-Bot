@@ -242,6 +242,8 @@ class Bot:
                 self._log_meta_event(e)
             case NoticeEvent() as e:
                 self._log_notice_event(e)
+                # 处理撤回通知，标记 ChatLog 中对应消息
+                self._handle_recall(e)
             case RequestEvent() as e:
                 self._log_request_event(e)
             case _:
@@ -483,7 +485,10 @@ class Bot:
 
         消息已撤回或不可用::
 
-            [回复:#1234 ← 消息已撤回或不可用]
+            [回复:#1234 ← 消息已撤回或无法获取]
+
+        注意：当 OneBot 实现（如 NapCat）在引用已撤回消息时完全不上报
+        reply 段时，此方法无法感知引用的存在——这是 OneBot 实现的固有限制。
 
         Args:
             content: 已提取的内容文本（包含 ``[回复:#id]`` 占位符）。
@@ -498,10 +503,24 @@ class Bot:
 
             reply_msg_id = seg.data.get("id")
             if not reply_msg_id:
+                # OneBot 实现上报了 reply 段但没有 id，生成兜底提示
+                self._logger.debug(f"reply 段缺少 id: {seg.data}")
+                placeholder = "[回复:#?]"
+                if placeholder in content:
+                    content = content.replace(
+                        placeholder, "[回复: 消息已撤回或无法获取]", 1
+                    )
                 continue
 
             placeholder = f"[回复:#{reply_msg_id}]"
             if placeholder not in content:
+                # 占位符不在 content 中，可能是 segments_to_content 未生成
+                # 将引用信息追加到 content 开头
+                self._logger.debug(
+                    f"占位符 {placeholder} 未在 content 中找到，追加到开头"
+                )
+                resolved = await self._fetch_reply_detail(reply_msg_id)
+                content = resolved + "\n" + content
                 continue
 
             resolved = await self._fetch_reply_detail(reply_msg_id)
@@ -524,7 +543,11 @@ class Bot:
             )
         except Exception as e:
             self._logger.debug(f"获取引用消息失败 (msg_id={msg_id}): {e}")
-            return f"[回复:#{msg_id} ← 消息已撤回或不可用]"
+            return f"[回复:#{msg_id} ← 消息已撤回或无法获取]"
+
+        # 检查返回数据是否为空或无效
+        if not data:
+            return f"[回复:#{msg_id} ← 消息已撤回或无法获取]"
 
         # 提取发送者信息
         sender = data.get("sender", {})
@@ -548,10 +571,29 @@ class Bot:
             # 降级：使用 raw_message 字段
             reply_content = data.get("raw_message", "")
 
+        # 检查解析后的内容是否为空（可能是已撤回的消息）
+        if not reply_content.strip():
+            return (
+                f"[回复:#{msg_id} ← {nickname}({user_id}) {time_str}"
+                f" | 消息已撤回或无法获取]"
+            )
+
         # 截断
         max_chars = self._REPLY_CONTENT_MAX_CHARS
         if len(reply_content) > max_chars:
             reply_content = reply_content[:max_chars] + "..."
+
+        # 检查该消息是否在 ChatLog 中被标记为已撤回
+        try:
+            is_recalled = self._chat_log.is_recalled(int(msg_id))
+        except (ValueError, TypeError):
+            is_recalled = False
+
+        if is_recalled:
+            return (
+                f"[回复:#{msg_id} ← {nickname}({user_id}) {time_str}"
+                f' | ⚠已撤回 | "{reply_content}"]'
+            )
 
         return (
             f'[回复:#{msg_id} ← {nickname}({user_id}) {time_str} | "{reply_content}"]'
@@ -595,6 +637,13 @@ class Bot:
             extra_info += f" | 用户:{event.raw_data['user_id']}"
 
         self._notice_logger.info(f"{event.notice_type}{extra_info}")
+
+    def _handle_recall(self, event: NoticeEvent) -> None:
+        """处理撤回通知，标记 GroupChatLog 中对应消息为已撤回。"""
+        if event.notice_type in ("group_recall", "friend_recall"):
+            msg_id = event.raw_data.get("message_id")
+            if msg_id is not None:
+                self._chat_log.mark_recalled(int(msg_id))
 
     def _log_request_event(self, event: RequestEvent) -> None:
         """记录请求事件日志。"""
