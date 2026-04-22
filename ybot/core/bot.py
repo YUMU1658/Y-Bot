@@ -270,7 +270,7 @@ class Bot:
         self,
         reply: str,
         *,
-        send_func: Callable[[str], Awaitable[None]],
+        send_func: Callable[[str, int | None], Awaitable[None]],
         interval: float = 1.0,
     ) -> None:
         """解析 AI 回复并按序发送消息。
@@ -280,7 +280,7 @@ class Bot:
 
         Args:
             reply: AI 原始回复文本。
-            send_func: 发送单条消息的异步函数（如 send_group_msg 的偏函数）。
+            send_func: 发送单条消息的异步函数（接受消息文本和可选的 reply_id）。
             interval: 多条消息之间的发送间隔（秒），默认 1.0。
         """
         messages = parse_reply(reply)
@@ -291,7 +291,7 @@ class Bot:
             return
 
         for i, msg in enumerate(messages):
-            await send_func(msg)
+            await send_func(msg.content, msg.reply_id)
             # 最后一条消息后不需要等待
             if i < len(messages) - 1:
                 await asyncio.sleep(interval)
@@ -324,10 +324,14 @@ class Bot:
         # 构建发送函数
         if msg_type == "group":
             group_id = data["group_id"]
-            send_func = lambda msg, gid=group_id: self.send_group_msg(gid, msg)
+            send_func = lambda msg, rid=None, gid=group_id: self.send_group_msg(
+                gid, msg, rid
+            )
         else:
             user_id = data["user_id"]
-            send_func = lambda msg, uid=user_id: self.send_private_msg(uid, msg)
+            send_func = lambda msg, rid=None, uid=user_id: self.send_private_msg(
+                uid, msg, rid
+            )
 
         if len(request.messages) == 1:
             # ---- 单条消息：直接使用已预处理的数据 ----
@@ -368,17 +372,23 @@ class Bot:
 
     # ---- 消息发送 ----
 
-    async def send_group_msg(self, group_id: int, message: str) -> None:
+    async def send_group_msg(
+        self, group_id: int, message: str, reply_id: int | None = None
+    ) -> None:
         """发送群聊消息。
 
         将文本中的 <at qq="..."/> 标签解析为 OneBot at 消息段，
-        以消息段数组格式发送。
+        以消息段数组格式发送。当 reply_id 不为 None 时，在消息段
+        数组最前面插入 reply 类型段以实现引用回复。
 
         Args:
             group_id: 目标群号。
             message: 消息文本（可能包含 <at> 标签）。
+            reply_id: 要引用的消息 ID（可选）。
         """
         segments = text_to_segments(message)
+        if reply_id is not None:
+            segments.insert(0, {"type": "reply", "data": {"id": str(reply_id)}})
         await self._ws_server.send_api(
             "send_group_msg",
             {
@@ -387,17 +397,23 @@ class Bot:
             },
         )
 
-    async def send_private_msg(self, user_id: int, message: str) -> None:
+    async def send_private_msg(
+        self, user_id: int, message: str, reply_id: int | None = None
+    ) -> None:
         """发送私聊消息。
 
         将文本中的 <at qq="..."/> 标签解析为 OneBot at 消息段，
-        以消息段数组格式发送。
+        以消息段数组格式发送。当 reply_id 不为 None 时，在消息段
+        数组最前面插入 reply 类型段以实现引用回复。
 
         Args:
             user_id: 目标用户 QQ 号。
             message: 消息文本（可能包含 <at> 标签）。
+            reply_id: 要引用的消息 ID（可选）。
         """
         segments = text_to_segments(message)
+        if reply_id is not None:
+            segments.insert(0, {"type": "reply", "data": {"id": str(reply_id)}})
         await self._ws_server.send_api(
             "send_private_msg",
             {

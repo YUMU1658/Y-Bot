@@ -41,6 +41,8 @@ _DEFAULT_SYSTEM_PROMPT = """\
 - 如需@某人，使用 <at qq="QQ号"/> 标签，例如：<at qq="123456"/> 你好
 - 如需@全体成员，使用 <at qq="all"/>
 - <at> 标签会被转换为真实的QQ@消息
+- 如需回复/引用某条消息，在 <send_msg> 标签中添加 reply_id 属性：<send_msg reply_id="消息ID">回复内容</send_msg>
+- reply_id 的值为要引用的消息的 message_id（数字）
 """
 
 
