@@ -50,6 +50,16 @@ _MIGRATION_ADD_CONTENT_TYPE = (
     "ALTER TABLE messages ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"
 )
 
+# 迁移 SQL：为已有数据库添加 last_invoked_at 列（跨会话记忆）
+_MIGRATION_ADD_LAST_INVOKED_AT = (
+    "ALTER TABLE sessions ADD COLUMN last_invoked_at REAL DEFAULT NULL"
+)
+
+# 迁移 SQL：为已有数据库添加 display_name 列（跨会话记忆）
+_MIGRATION_ADD_DISPLAY_NAME = (
+    "ALTER TABLE sessions ADD COLUMN display_name TEXT DEFAULT NULL"
+)
+
 
 class ConversationStore:
     """对话存储层，封装所有 SQLite 操作。
@@ -85,6 +95,20 @@ class ConversationStore:
         # 迁移：为已有数据库添加 content_type 列（如果不存在）
         try:
             await self._db.execute(_MIGRATION_ADD_CONTENT_TYPE)
+            await self._db.commit()
+        except Exception:
+            pass
+
+        # 迁移：为已有数据库添加 last_invoked_at 列（跨会话记忆）
+        try:
+            await self._db.execute(_MIGRATION_ADD_LAST_INVOKED_AT)
+            await self._db.commit()
+        except Exception:
+            pass
+
+        # 迁移：为已有数据库添加 display_name 列（跨会话记忆）
+        try:
+            await self._db.execute(_MIGRATION_ADD_DISPLAY_NAME)
             await self._db.commit()
         except Exception:
             pass
@@ -227,6 +251,82 @@ class ConversationStore:
         if row is None or row[0] is None:
             return None
         return int(row[0])
+
+    async def update_session_meta(
+        self, session_key: str, display_name: str | None = None
+    ) -> None:
+        """更新会话的唤醒时间和显示名称。
+
+        Args:
+            session_key: 会话标识。
+            display_name: 会话显示名称（如群名、好友昵称）。
+        """
+        assert self._db is not None, "ConversationStore 未初始化"
+
+        now = time.time()
+        if display_name is not None:
+            await self._db.execute(
+                "UPDATE sessions SET last_invoked_at = ?, display_name = ? "
+                "WHERE session_key = ?",
+                (now, display_name, session_key),
+            )
+        else:
+            await self._db.execute(
+                "UPDATE sessions SET last_invoked_at = ? WHERE session_key = ?",
+                (now, session_key),
+            )
+        await self._db.commit()
+
+    async def get_recent_other_sessions(
+        self,
+        current_session_key: str,
+        max_sessions: int = 5,
+        decay_limits: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """获取最近被唤醒的其他会话的压缩记录。
+
+        按唤醒时间降序排列，每个会话按衰减限制获取最近 N 条消息。
+
+        Args:
+            current_session_key: 当前会话标识（排除自身）。
+            max_sessions: 最大返回会话数。
+            decay_limits: 每个旧会话保留的消息条数（按远近递减）。
+
+        Returns:
+            按唤醒时间降序排列的会话列表，每个包含：
+            - session_key: 会话标识
+            - display_name: 会话显示名称
+            - last_invoked_at: 最后唤醒时间戳
+            - messages: 该会话的最近消息列表
+        """
+        assert self._db is not None, "ConversationStore 未初始化"
+
+        if decay_limits is None:
+            decay_limits = [20, 15, 10, 5, 3]
+
+        # 查询最近唤醒的其他会话
+        cursor = await self._db.execute(
+            "SELECT session_key, display_name, last_invoked_at FROM sessions "
+            "WHERE session_key != ? AND last_invoked_at IS NOT NULL "
+            "ORDER BY last_invoked_at DESC LIMIT ?",
+            (current_session_key, max_sessions),
+        )
+        sessions = await cursor.fetchall()
+
+        result: list[dict[str, Any]] = []
+        for i, (sk, name, invoked_at) in enumerate(sessions):
+            limit = decay_limits[i] if i < len(decay_limits) else decay_limits[-1]
+            messages = await self.get_history(sk, limit=limit)
+            if messages:  # 跳过空会话
+                result.append(
+                    {
+                        "session_key": sk,
+                        "display_name": name or sk,  # 降级到 session_key
+                        "last_invoked_at": invoked_at,
+                        "messages": messages,
+                    }
+                )
+        return result
 
     async def clear_session(self, session_key: str) -> None:
         """清空指定会话的所有消息（保留 session 记录）。

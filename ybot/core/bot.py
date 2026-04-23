@@ -197,6 +197,9 @@ class Bot:
                         )
                         # 提取当前触发消息中的图片 URL
                         image_urls = self._extract_image_urls(e)
+                        # 提取群名用于跨会话记忆标识（命中 BotInfoService 缓存）
+                        group_info = await self._bot_info.get_group_info(e.group_id)
+                        display_name = group_info.group_name or f"群{e.group_id}"
                         # 提交到防抖队列（不再直接 await AI 调用）
                         queued = QueuedMessage(
                             formatted_msg=formatted_msg,
@@ -208,6 +211,7 @@ class Bot:
                                 "last_ref_id": last_ref_id,
                                 "image_urls": image_urls,
                                 "group_id": e.group_id,
+                                "display_name": display_name,
                             },
                         )
                         self._request_queue.submit(
@@ -235,6 +239,17 @@ class Bot:
                     formatted_msg = self._msg_formatter.format_private_message(e, text)
                     # 提取当前触发消息中的图片 URL
                     image_urls = self._extract_image_urls(e)
+                    # 构建跨会话记忆的显示名称
+                    display_name = e.sender.nickname or str(e.user_id)
+                    if e.sub_type == "group":
+                        # 临时会话：追加来源群名
+                        temp_group_info = await self._bot_info.get_group_info(
+                            temp_group_id
+                        )
+                        temp_group_name = temp_group_info.group_name or str(
+                            temp_group_id
+                        )
+                        display_name = f"{display_name} ← {temp_group_name}"
                     # 提交到防抖队列（不再直接 await AI 调用）
                     queued = QueuedMessage(
                         formatted_msg=formatted_msg,
@@ -244,6 +259,7 @@ class Bot:
                             "env_header": env_header,
                             "image_urls": image_urls,
                             "user_id": e.user_id,
+                            "display_name": display_name,
                         },
                     )
                     self._request_queue.submit(
@@ -367,6 +383,7 @@ class Bot:
             env_header,
             last_ref_msg_id=last_ref_id,
             image_urls=all_image_urls or None,
+            display_name=data.get("display_name"),
         )
         await self._send_reply(reply, send_func=send_func)
 

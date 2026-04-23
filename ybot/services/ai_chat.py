@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
@@ -17,6 +18,9 @@ from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger
 
 logger = get_logger("AI")
+
+# 北京时间 UTC+8
+_CST = timezone(timedelta(hours=8))
 
 # 临时默认系统提示词 —— 指导模型使用 <send_msg> 格式
 # TODO: 后续迁移到配置文件或专门的提示词管理模块
@@ -85,6 +89,7 @@ class AIChatService:
         env_header: str = "",
         last_ref_msg_id: int | None = None,
         image_urls: list[str] | None = None,
+        display_name: str | None = None,
     ) -> str:
         """发送多轮对话请求，返回 AI 回复文本。
 
@@ -92,6 +97,8 @@ class AIChatService:
         1. 将用户消息存入数据库
         2. 从数据库获取历史消息
         3. 构建 messages 列表（env_header + system prompt 拼接为 system message + 历史）
+        3.5 注入跨会话记忆（如果启用）
+        3.6 更新会话唤醒时间和显示名称
         4. 调用 OpenAI API
         5. 将 AI 回复存入数据库
         6. 返回回复文本
@@ -102,6 +109,7 @@ class AIChatService:
             env_header: ENV 头部文本（可选），拼接到 system prompt 前面。
             last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（用于跨轮去重）。
             image_urls: 当前触发消息中的图片 URL 列表（可选）。仅在 enable_vision=True 时生效。
+            display_name: 会话显示名称（如群名、好友昵称），用于跨会话记忆标识。
 
         Returns:
             AI 回复的文本内容。
@@ -163,6 +171,21 @@ class AIChatService:
 
         messages.extend(history)
 
+        # 3.5 注入跨会话记忆
+        if self._config.enable_cross_session:
+            other_sessions = await self._store.get_recent_other_sessions(
+                current_session_key=session_key,
+                max_sessions=self._config.cross_session_max,
+                decay_limits=self._config.cross_session_decay,
+            )
+            cross_msg = self._build_cross_session_message(other_sessions)
+            if cross_msg:
+                # 插入到 system message 之后（index 1）
+                messages.insert(1, {"role": "user", "content": cross_msg})
+
+        # 3.6 更新唤醒时间和显示名称
+        await self._store.update_session_meta(session_key, display_name)
+
         # 当前轮使用 vision 时，history 中最后一条 user 消息的图片已被替换为占位符，
         # 需要还原为原始 multimodal content（包含真实 image_url）
         if use_vision:
@@ -209,3 +232,60 @@ class AIChatService:
 
         # 6. 返回
         return reply
+
+    @staticmethod
+    def _build_cross_session_message(
+        other_sessions: list[dict[str, Any]],
+    ) -> str | None:
+        """将跨会话记录格式化为注入消息。
+
+        每个旧会话的消息内容保持原始格式（含完整元信息），
+        assistant 消息保留原始格式（含 <send_msg> 标签）。
+
+        Args:
+            other_sessions: 其他会话的压缩记录列表。
+
+        Returns:
+            格式化后的跨会话记忆消息文本，如果没有旧会话则返回 None。
+        """
+        if not other_sessions:
+            return None
+
+        lines = [
+            "=== 以下是其他会话的近期记录（仅供参考，帮助你了解自己在其他场景的交互） ==="
+        ]
+
+        for session_data in other_sessions:
+            sk = session_data["session_key"]
+            display_name = session_data["display_name"]
+            invoked_at = session_data["last_invoked_at"]
+            messages = session_data["messages"]
+
+            # 格式化会话标识和时间
+            dt = datetime.fromtimestamp(invoked_at, tz=_CST)
+            time_str = dt.strftime("%Y-%m-%d %H:%M")
+
+            lines.append("")
+            lines.append(f"[会话: {display_name}({sk}) | 最后唤醒: {time_str}]")
+
+            # 直接拼接原始消息内容
+            for msg in messages:
+                content = msg["content"]
+                if isinstance(content, list):
+                    # multimodal 消息，提取文本部分
+                    text_parts = [
+                        item["text"]
+                        for item in content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    ]
+                    content = "\n".join(text_parts)
+
+                if msg["role"] == "assistant":
+                    lines.append(f"[BOT回复]\n{content}")
+                else:
+                    lines.append(content)
+
+        lines.append("")
+        lines.append("=== 以上是其他会话的近期记录 ===")
+
+        return "\n".join(lines)
