@@ -14,6 +14,7 @@ from typing import Any
 import aiohttp
 
 from ybot.core.config import AIConfig
+from ybot.services.preset import PresetManager
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger
 
@@ -21,34 +22,6 @@ logger = get_logger("AI")
 
 # 北京时间 UTC+8
 _CST = timezone(timedelta(hours=8))
-
-# 临时默认系统提示词 —— 指导模型使用 <send_msg> 格式
-# TODO: 后续迁移到配置文件或专门的提示词管理模块
-_DEFAULT_SYSTEM_PROMPT = """\
-# 消息发送格式
-
-你必须使用 <send_msg> 标签来发送消息。标签外的内容不会被发送，可用于思考。
-
-格式示例：
-思考过程（不会发送）
-<send_msg>这是要发送的消息</send_msg>
-
-如需发送多条消息：
-<send_msg>第一条消息</send_msg>
-<send_msg>第二条消息</send_msg>
-
-规则：
-- 所有要发送给用户的内容必须放在 <send_msg></send_msg> 标签内
-- 标签外的文字是你的思考过程，不会被发送
-- 可以发送多条消息，系统会按顺序依次发送
-- 每条消息内可以换行
-- 如需@某人，使用 <at qq="QQ号"/> 标签，例如：<at qq="123456"/> 你好
-- 如需@全体成员，使用 <at qq="all"/>
-- <at> 标签会被转换为真实的QQ@消息
-- 如需回复/引用某条消息，在 <send_msg> 标签中添加 reply_id 属性：<send_msg reply_id="消息ID">回复内容</send_msg>
-- reply_id 的值为要引用的消息的 message_id（数字）
-"""
-
 
 class AIChatService:
     """AI 对话服务。
@@ -66,6 +39,11 @@ class AIChatService:
         self._config = config
         self._store = store
         self._session: aiohttp.ClientSession | None = None
+        self._preset_manager = PresetManager(
+            preset_dir=config.preset_dir,
+            preset_name=config.preset_name,
+            enabled=config.preset_enabled,
+        )
 
     async def start(self) -> None:
         """初始化 HTTP 会话。
@@ -96,7 +74,7 @@ class AIChatService:
         流程：
         1. 将用户消息存入数据库
         2. 从数据库获取历史消息
-        3. 构建 messages 列表（env_header + system prompt 拼接为 system message + 历史）
+        3. 构建 messages 列表（高级预设 + env_header + system prompt + 历史）
         3.5 注入跨会话记忆（如果启用）
         3.6 更新会话唤醒时间和显示名称
         4. 调用 OpenAI API
@@ -155,45 +133,34 @@ class AIChatService:
             session_key, limit=self._config.max_history
         )
 
-        # 3. 构建 messages 列表
-        messages: list[dict[str, Any]] = []
+        # 当前轮使用 vision 时，history 中最后一条 user 消息的图片已被替换为占位符，
+        # 需要先还原为原始 multimodal content，再交给预设系统包裹文本。
+        if use_vision:
+            for i in range(len(history) - 1, -1, -1):
+                if history[i].get("role") == "user":
+                    history[i] = {"role": "user", "content": content_array}
+                    break
 
-        # 拼接 ENV 头部 + 临时默认提示词 + system prompt 为一条 system message
-        full_system_prompt = ""
-        if env_header:
-            full_system_prompt += env_header + "\n"
-        # 拼接临时默认系统提示词（消息格式指导）
-        full_system_prompt += _DEFAULT_SYSTEM_PROMPT + "\n"
-        if self._config.system_prompt:
-            full_system_prompt += self._config.system_prompt
-
-        messages.append({"role": "system", "content": full_system_prompt})
-
-        messages.extend(history)
-
-        # 3.5 注入跨会话记忆
+        # 3. 构建跨会话记忆
+        cross_session_message: str | None = None
         if self._config.enable_cross_session:
             other_sessions = await self._store.get_recent_other_sessions(
                 current_session_key=session_key,
                 max_sessions=self._config.cross_session_max,
                 decay_limits=self._config.cross_session_decay,
             )
-            cross_msg = self._build_cross_session_message(other_sessions)
-            if cross_msg:
-                # 插入到 system message 之后（index 1）
-                messages.insert(1, {"role": "user", "content": cross_msg})
+            cross_session_message = self._build_cross_session_message(other_sessions)
 
         # 3.6 更新唤醒时间和显示名称
         await self._store.update_session_meta(session_key, display_name)
 
-        # 当前轮使用 vision 时，history 中最后一条 user 消息的图片已被替换为占位符，
-        # 需要还原为原始 multimodal content（包含真实 image_url）
-        if use_vision:
-            # 从后往前找到最后一条 user 消息并替换其 content
-            for i in range(len(messages) - 1, -1, -1):
-                if messages[i].get("role") == "user":
-                    messages[i] = {"role": "user", "content": content_array}
-                    break
+        # 3.7 构建最终 messages 列表
+        messages = self._preset_manager.build_messages(
+            env_header=env_header,
+            character_prompt=self._config.system_prompt,
+            history=history,
+            cross_session_message=cross_session_message,
+        )
 
         # 4. 调用 API
         url = f"{self._config.api_base.rstrip('/')}/chat/completions"
