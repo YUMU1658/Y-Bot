@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -15,6 +17,8 @@ import aiohttp
 
 from ybot.core.config import AIConfig
 from ybot.services.preset import PresetManager
+from ybot.services.reply_parser import ParsedMessage
+from ybot.services.stream_parser import StreamSendMsgParser
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger
 
@@ -22,6 +26,17 @@ logger = get_logger("AI")
 
 # 北京时间 UTC+8
 _CST = timezone(timedelta(hours=8))
+
+
+@dataclass
+class _PreparedChat:
+    """_prepare_chat() 的返回值，包含 API 调用所需的全部数据。"""
+
+    session_key: str
+    url: str
+    headers: dict[str, str]
+    payload: dict[str, Any]
+
 
 class AIChatService:
     """AI 对话服务。
@@ -60,7 +75,9 @@ class AIChatService:
             self._session = None
             logger.info("AI 服务已关闭")
 
-    async def chat(
+    # ---- 公共前置逻辑 ----
+
+    async def _prepare_chat(
         self,
         session_key: str,
         user_message: str,
@@ -68,30 +85,24 @@ class AIChatService:
         last_ref_msg_id: int | None = None,
         image_urls: list[str] | None = None,
         display_name: str | None = None,
-    ) -> str:
-        """发送多轮对话请求，返回 AI 回复文本。
+    ) -> _PreparedChat | str:
+        """chat() 和 chat_stream() 的公共前置逻辑。
 
-        流程：
-        1. 将用户消息存入数据库
-        2. 从数据库获取历史消息
-        3. 构建 messages 列表（高级预设 + env_header + system prompt + 历史）
-        3.5 注入跨会话记忆（如果启用）
-        3.6 更新会话唤醒时间和显示名称
-        4. 调用 OpenAI API
-        5. 将 AI 回复存入数据库
-        6. 返回回复文本
+        执行步骤 1-3.7：存储用户消息、获取历史、构建跨会话记忆、
+        更新会话元数据、构建 messages 列表和 API 请求参数。
 
         Args:
-            session_key: 会话标识（如 ``friend_12345``、``group_67890`` 或 ``temp_11111_22222``）。
-            user_message: 用户消息文本（已包含元信息格式化）。
-            env_header: ENV 头部文本（可选），拼接到 system prompt 前面。
-            last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（用于跨轮去重）。
-            image_urls: 当前触发消息中的图片 URL 列表（可选）。仅在 enable_vision=True 时生效。
-            display_name: 会话显示名称（如群名、好友昵称），用于跨会话记忆标识。
+            session_key: 会话标识。
+            user_message: 用户消息文本。
+            env_header: ENV 头部文本。
+            last_ref_msg_id: 参考聊天记录去重边界。
+            image_urls: 图片 URL 列表。
+            display_name: 会话显示名称。
 
         Returns:
-            AI 回复的文本内容。
+            成功时返回 _PreparedChat；前置检查失败时返回错误提示字符串。
         """
+        # 前置检查
         if not self._session:
             logger.error("AI 服务未初始化，请先调用 start()")
             return "[AI 服务未初始化]"
@@ -162,19 +173,67 @@ class AIChatService:
             cross_session_message=cross_session_message,
         )
 
-        # 4. 调用 API
+        # 构建 API 请求参数
         url = f"{self._config.api_base.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self._config.api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
+        payload: dict[str, Any] = {
             "model": self._config.model,
             "messages": messages,
         }
 
+        return _PreparedChat(
+            session_key=session_key,
+            url=url,
+            headers=headers,
+            payload=payload,
+        )
+
+    # ---- 非流式对话 ----
+
+    async def chat(
+        self,
+        session_key: str,
+        user_message: str,
+        env_header: str = "",
+        last_ref_msg_id: int | None = None,
+        image_urls: list[str] | None = None,
+        display_name: str | None = None,
+    ) -> str:
+        """发送多轮对话请求，返回 AI 回复文本（非流式）。
+
+        流程：
+        1-3.7. 前置逻辑（由 _prepare_chat 完成）
+        4. 调用 OpenAI API（非流式，等待完整响应）
+        5. 将 AI 回复存入数据库
+        6. 返回回复文本
+
+        Args:
+            session_key: 会话标识（如 ``friend_12345``、``group_67890`` 或 ``temp_11111_22222``）。
+            user_message: 用户消息文本（已包含元信息格式化）。
+            env_header: ENV 头部文本（可选），拼接到 system prompt 前面。
+            last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（用于跨轮去重）。
+            image_urls: 当前触发消息中的图片 URL 列表（可选）。仅在 enable_vision=True 时生效。
+            display_name: 会话显示名称（如群名、好友昵称），用于跨会话记忆标识。
+
+        Returns:
+            AI 回复的文本内容。
+        """
+        prepared = await self._prepare_chat(
+            session_key, user_message, env_header,
+            last_ref_msg_id, image_urls, display_name,
+        )
+        # 前置检查失败时 _prepare_chat 返回错误字符串
+        if isinstance(prepared, str):
+            return prepared
+
+        # 4. 调用 API（非流式）
         try:
-            async with self._session.post(url, json=payload, headers=headers) as resp:
+            async with self._session.post(  # type: ignore[union-attr]
+                prepared.url, json=prepared.payload, headers=prepared.headers
+            ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     logger.error(
@@ -195,9 +254,100 @@ class AIChatService:
             return "[AI 调用失败]"
 
         # 5. 存入 AI 回复
-        await self._store.add_message(session_key, "assistant", reply)
+        await self._store.add_message(prepared.session_key, "assistant", reply)
 
         # 6. 返回
+        return reply
+
+    # ---- 流式对话 ----
+
+    async def chat_stream(
+        self,
+        session_key: str,
+        user_message: str,
+        env_header: str = "",
+        last_ref_msg_id: int | None = None,
+        image_urls: list[str] | None = None,
+        display_name: str | None = None,
+        on_message: Callable[[ParsedMessage], Awaitable[None]] | None = None,
+    ) -> str:
+        """流式对话请求。
+
+        与 chat() 共享前置逻辑，但 API 调用使用 stream=True。
+        每当检测到完整的 <send_msg> 块时，通过 on_message 回调通知。
+        完整回复在流结束后一次性存入数据库，与非流式行为一致。
+
+        Args:
+            session_key: 会话标识。
+            user_message: 用户消息文本。
+            env_header: ENV 头部文本。
+            last_ref_msg_id: 参考聊天记录去重边界。
+            image_urls: 图片 URL 列表。
+            display_name: 会话显示名称。
+            on_message: 检测到完整 <send_msg> 块时的回调函数。
+
+        Returns:
+            完整的 AI 回复文本（用于日志/调试）。
+        """
+        prepared = await self._prepare_chat(
+            session_key, user_message, env_header,
+            last_ref_msg_id, image_urls, display_name,
+        )
+        if isinstance(prepared, str):
+            return prepared
+
+        # 启用流式模式
+        prepared.payload["stream"] = True
+        parser = StreamSendMsgParser()
+
+        # 4. 流式调用 API
+        try:
+            async with self._session.post(  # type: ignore[union-attr]
+                prepared.url, json=prepared.payload, headers=prepared.headers
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(
+                        f"AI API 流式请求失败 (HTTP {resp.status}): {error_text[:200]}"
+                    )
+                    return f"[AI 请求失败: HTTP {resp.status}]"
+
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        break
+
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk["choices"][0]["delta"].get("content", "")
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+
+                    if not delta:
+                        continue
+
+                    # 喂入增量解析器
+                    new_messages = parser.feed(delta)
+                    if on_message:
+                        for msg in new_messages:
+                            await on_message(msg)
+
+        except aiohttp.ClientError as e:
+            logger.error(f"AI API 流式网络错误: {e}")
+            return "[AI 网络错误]"
+        except Exception as e:
+            logger.error(f"AI 流式调用时发生未知错误: {e}")
+            return "[AI 调用失败]"
+
+        # 获取完整回复
+        reply = parser.get_full_response()
+
+        # 5. 存入 AI 回复
+        await self._store.add_message(prepared.session_key, "assistant", reply)
+
         return reply
 
     @staticmethod

@@ -36,7 +36,7 @@ from ybot.services.ai_chat import AIChatService
 from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
 from ybot.services.message_builder import text_to_segments
-from ybot.services.reply_parser import parse_reply
+from ybot.services.reply_parser import ParsedMessage, parse_reply
 from ybot.storage.chat_log import ChatLogEntry, GroupChatLog
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger, setup_logger
@@ -312,6 +312,107 @@ class Bot:
             if i < len(messages) - 1:
                 await asyncio.sleep(interval)
 
+    # ---- 流式请求处理 ----
+
+    async def _process_ai_request_stream(self, request: PendingRequest) -> None:
+        """流式模式的 AI 请求处理。
+
+        使用 asyncio.Queue 作为消息管道（生产者-消费者模式）：
+        - 生产者：LLM 流式回调将 ParsedMessage 放入队列
+        - 消费者：sender_worker 从队列取消息，按 1 秒间隔发送
+
+        与 ``_process_ai_request()`` 共享前置的上下文构建逻辑，
+        仅在 API 调用和消息发送部分不同。
+
+        Args:
+            request: 包含一条或多条合并消息的待处理请求。
+        """
+        # ---- 共享前置逻辑：构建 send_func、user_message 等 ----
+        last_msg = request.messages[-1]
+        data = last_msg.context_data
+        session_key = data["session_key"]
+        env_header = data["env_header"]
+        msg_type = data["type"]
+
+        # 合并所有消息的图片 URL
+        all_image_urls: list[str] = []
+        for m in request.messages:
+            urls = m.context_data.get("image_urls", [])
+            if urls:
+                all_image_urls.extend(urls)
+
+        # 构建发送函数
+        if msg_type == "group":
+            group_id = data["group_id"]
+            send_func = lambda msg, rid=None, gid=group_id: self.send_group_msg(
+                gid, msg, rid
+            )
+        else:
+            user_id = data["user_id"]
+            send_func = lambda msg, rid=None, uid=user_id: self.send_private_msg(
+                uid, msg, rid
+            )
+
+        if len(request.messages) == 1:
+            if msg_type == "group":
+                user_message = data["context_msg"]
+                last_ref_id = data["last_ref_id"]
+            else:
+                user_message = last_msg.formatted_msg
+                last_ref_id = None
+        else:
+            if msg_type == "group":
+                first_data = request.messages[0].context_data
+                parts = [first_data["context_msg"]]
+                for m in request.messages[1:]:
+                    parts.append(m.formatted_msg)
+                user_message = "\n".join(parts)
+                last_ref_id = data["last_ref_id"]
+            else:
+                parts = [m.formatted_msg for m in request.messages]
+                user_message = "\n".join(parts)
+                last_ref_id = None
+
+        # ---- 流式特有逻辑：生产者-消费者模式 ----
+        msg_queue: asyncio.Queue[ParsedMessage | None] = asyncio.Queue()
+
+        async def on_message(msg: ParsedMessage) -> None:
+            """流式回调：将完整消息放入队列。"""
+            await msg_queue.put(msg)
+
+        async def sender_worker() -> None:
+            """消费者：从队列取消息，延迟 1 秒后发送。"""
+            while True:
+                msg = await msg_queue.get()
+                if msg is None:  # 哨兵值，表示流结束
+                    break
+                await asyncio.sleep(1.0)
+                await send_func(msg.content, msg.reply_id)
+
+        # 并发运行：LLM 流式请求 + 消息发送
+        sender_task = asyncio.create_task(sender_worker())
+
+        try:
+            reply = await self._ai_chat.chat_stream(
+                session_key,
+                user_message,
+                env_header,
+                last_ref_msg_id=last_ref_id,
+                image_urls=all_image_urls or None,
+                display_name=data.get("display_name"),
+                on_message=on_message,
+            )
+        finally:
+            # 无论成功还是异常，都发送哨兵值确保 sender_worker 退出
+            await msg_queue.put(None)
+
+        await sender_task  # 等待所有消息发送完毕
+
+        # 检查流式响应中是否包含 <send_msg> 标签
+        if reply and not parse_reply(reply):
+            _logger.warning("AI 回复中未包含 <send_msg> 标签，跳过发送")
+            _logger.debug(f"原始回复: {reply[:200]}")
+
     # ---- 请求队列回调 ----
 
     async def _process_ai_request(self, request: PendingRequest) -> None:
@@ -320,9 +421,14 @@ class Bot:
         由 RequestQueue 的 worker 协程调用。根据消息类型（群聊/私聊）
         和消息数量（单条/多条合并）构建最终的 user message 并调用 LLM。
 
+        当 ``enable_stream`` 启用时，委托给 ``_process_ai_request_stream()``。
+
         Args:
             request: 包含一条或多条合并消息的待处理请求。
         """
+        if self.config.ai.enable_stream:
+            await self._process_ai_request_stream(request)
+            return
         # 使用最后一条消息的上下文数据（最新状态）
         last_msg = request.messages[-1]
         data = last_msg.context_data
