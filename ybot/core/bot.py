@@ -10,6 +10,7 @@ import asyncio
 import signal
 import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -35,6 +36,7 @@ from ybot.models.message import (
 from ybot.services.ai_chat import AIChatService
 from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
+from ybot.services.interceptor import InterceptorService
 from ybot.services.message_builder import text_to_segments
 from ybot.services.reply_parser import ParsedMessage, parse_reply
 from ybot.storage.chat_log import ChatLogEntry, GroupChatLog
@@ -43,6 +45,16 @@ from ybot.utils.logger import get_logger, setup_logger
 
 # 模块级 logger，用于 _send_reply 等非实例方法的日志
 _logger = get_logger("Bot")
+
+
+@dataclass
+class _ActiveTask:
+    """当前正在处理的 AI 请求的运行时状态（截断器使用）。"""
+
+    cancel_event: asyncio.Event  # 被设置时表示应取消当前任务
+    context_messages: list[dict[str, Any]] | None = None  # 发送给主模型的完整 messages
+    partial_response: str = ""  # 流式模式下已累积的部分回复
+    completed: bool = False  # 是否已完成处理
 
 
 class Bot:
@@ -86,6 +98,15 @@ class Bot:
         # 初始化防抖 + 单线程请求队列
         self._request_queue = RequestQueue(debounce_seconds=1.0)
 
+        # 初始化截断器服务
+        self._interceptor: InterceptorService | None = None
+        if config.interceptor.enabled:
+            self._interceptor = InterceptorService(config.interceptor, config.ai)
+            self._request_queue.set_interrupt_callback(self._on_interrupt_check)
+
+        # 截断器状态：session_key → 当前处理任务的取消控制
+        self._active_tasks: dict[str, _ActiveTask] = {}
+
         self._running = False
         self._bot_info_initialized = False
 
@@ -114,6 +135,8 @@ class Bot:
         # 启动 AI 服务（需在事件循环中创建 aiohttp 会话）
         await self._conv_store.initialize()
         await self._ai_chat.start()
+        if self._interceptor:
+            await self._interceptor.start()
         await self._request_queue.start()
         await self._ws_server.start()
 
@@ -137,6 +160,8 @@ class Bot:
         self._logger.info("正在关闭 Y-BOT...")
         await self._ws_server.stop()
         await self._request_queue.stop()
+        if self._interceptor:
+            await self._interceptor.stop()
         await self._ai_chat.stop()
         await self._conv_store.close()
         self._logger.info("Y-BOT 已关闭")
@@ -373,12 +398,34 @@ class Bot:
                 user_message = "\n".join(parts)
                 last_ref_id = None
 
+        # 注入打断提示（如果有）
+        interrupt_hint = request.messages[0].context_data.get("interrupt_hint")
+        if interrupt_hint:
+            user_message = interrupt_hint + "\n\n" + user_message
+
+        # ---- 截断器：注册活跃任务 ----
+        active_task: _ActiveTask | None = None
+        if self._interceptor:
+            active_task = _ActiveTask(cancel_event=asyncio.Event())
+            self._active_tasks[session_key] = active_task
+
         # ---- 流式特有逻辑：生产者-消费者模式 ----
         msg_queue: asyncio.Queue[ParsedMessage | None] = asyncio.Queue()
+        sent_messages: list[str] = []  # 追踪已发送的消息
 
         async def on_message(msg: ParsedMessage) -> None:
             """流式回调：将完整消息放入队列。"""
             await msg_queue.put(msg)
+
+        def on_partial(full_response: str) -> None:
+            """部分回复更新回调：同步更新 active_task 的 partial_response。"""
+            if active_task:
+                active_task.partial_response = full_response
+
+        def on_prepared(messages: list[dict[str, Any]]) -> None:
+            """prepare 完成回调：记录发送给主模型的 messages。"""
+            if active_task:
+                active_task.context_messages = messages
 
         async def sender_worker() -> None:
             """消费者：从队列取消息，延迟 1 秒后发送。"""
@@ -387,7 +434,11 @@ class Bot:
                 if msg is None:  # 哨兵值，表示流结束
                     break
                 await asyncio.sleep(1.0)
+                # 检查是否被打断（避免在打断后继续发送）
+                if active_task and active_task.cancel_event.is_set():
+                    break
                 await send_func(msg.content, msg.reply_id)
+                sent_messages.append(msg.content)
 
         # 并发运行：LLM 流式请求 + 消息发送
         sender_task = asyncio.create_task(sender_worker())
@@ -401,12 +452,27 @@ class Bot:
                 image_urls=all_image_urls or None,
                 display_name=data.get("display_name"),
                 on_message=on_message,
+                cancel_event=active_task.cancel_event if active_task else None,
+                on_partial=on_partial if active_task else None,
+                on_prepared=on_prepared if active_task else None,
             )
         finally:
             # 无论成功还是异常，都发送哨兵值确保 sender_worker 退出
             await msg_queue.put(None)
 
         await sender_task  # 等待所有消息发送完毕
+
+        # ---- 截断器：检查是否被打断 ----
+        if active_task:
+            active_task.completed = True
+            self._active_tasks.pop(session_key, None)
+
+            if active_task.cancel_event.is_set():
+                _logger.info(f"流式回复被打断，重新处理 (session={session_key})")
+                await self._reprocess_after_interrupt(
+                    request, session_key, sent_messages=sent_messages or None
+                )
+                return
 
         # 检查流式响应中是否包含 <send_msg> 标签
         if reply and not parse_reply(reply):
@@ -482,6 +548,22 @@ class Bot:
                 user_message = "\n".join(parts)
                 last_ref_id = None
 
+        # 注入打断提示（如果有）
+        interrupt_hint = request.messages[0].context_data.get("interrupt_hint")
+        if interrupt_hint:
+            user_message = interrupt_hint + "\n\n" + user_message
+
+        # 截断器：注册活跃任务
+        active_task: _ActiveTask | None = None
+        if self._interceptor:
+            active_task = _ActiveTask(cancel_event=asyncio.Event())
+            self._active_tasks[session_key] = active_task
+
+        def on_prepared(messages: list[dict[str, Any]]) -> None:
+            """prepare 完成回调：记录发送给主模型的 messages。"""
+            if active_task:
+                active_task.context_messages = messages
+
         # 调用 LLM
         reply = await self._ai_chat.chat(
             session_key,
@@ -490,8 +572,123 @@ class Bot:
             last_ref_msg_id=last_ref_id,
             image_urls=all_image_urls or None,
             display_name=data.get("display_name"),
+            on_prepared=on_prepared if active_task else None,
         )
+
+        # 截断器：检查是否被打断
+        if active_task:
+            active_task.completed = True
+            self._active_tasks.pop(session_key, None)
+
+            if active_task.cancel_event.is_set():
+                _logger.info(f"回复被打断，重新处理 (session={session_key})")
+                await self._reprocess_after_interrupt(request, session_key)
+                return
+
         await self._send_reply(reply, send_func=send_func)
+
+    # ---- 截断器回调与重新处理 ----
+
+    async def _on_interrupt_check(
+        self, session_key: str, new_message: QueuedMessage
+    ) -> None:
+        """当同会话新消息到达且当前正在处理该会话时调用。
+
+        由 RequestQueue.submit() 通过 asyncio.create_task 异步触发。
+        调用截断器小模型判断是否应该打断当前回复。
+
+        Args:
+            session_key: 会话标识。
+            new_message: 新到达的消息。
+        """
+        if self._interceptor is None:
+            return
+
+        active = self._active_tasks.get(session_key)
+        if active is None or active.completed:
+            return  # 没有活跃任务或已完成，正常走队列合并
+
+        # 调用截断器小模型判断
+        decision = await self._interceptor.should_interrupt(
+            character_prompt=self.config.ai.system_prompt,
+            context_messages=active.context_messages or [],
+            partial_response=active.partial_response or None,
+            new_message=new_message.formatted_msg,
+            session_key=session_key,
+        )
+
+        # 判断返回时再次检查任务是否已完成
+        if active.completed:
+            _logger.info(
+                f"截断判断返回时任务已完成，丢弃判断结果 (session={session_key})"
+            )
+            return
+
+        if decision.interrupt:
+            _logger.info(
+                f"截断器决定打断 (session={session_key}): {decision.reason}"
+            )
+            active.cancel_event.set()  # 通知当前任务取消
+        else:
+            _logger.info(
+                f"截断器决定不打断 (session={session_key}): {decision.reason}"
+            )
+
+    async def _reprocess_after_interrupt(
+        self,
+        original_request: PendingRequest,
+        session_key: str,
+        sent_messages: list[str] | None = None,
+    ) -> None:
+        """打断后合并队列中的消息并重新处理。
+
+        Args:
+            original_request: 被打断的原始请求。
+            session_key: 会话标识。
+            sent_messages: 流式模式下已发送的消息内容列表。
+        """
+        # 1. 从 pending 和 queue 中收集同 session 的所有消息
+        merged_messages = list(original_request.messages)
+
+        # 收集 pending 中的
+        pending = self._request_queue.drain_pending(session_key)
+        if pending:
+            merged_messages.extend(pending.messages)
+
+        # 收集 queue 中的
+        queued = self._request_queue.drain_queued(session_key)
+        if queued:
+            merged_messages.extend(queued.messages)
+
+        # 2. 构建打断上下文提示
+        interrupt_hint = (
+            "[系统提示：你之前正在回复的消息被打断了，因为同一会话收到了新的消息。"
+            "请基于最新的完整上下文重新回复。"
+        )
+        if sent_messages:
+            sent_text = "\n".join(f"- {msg}" for msg in sent_messages)
+            interrupt_hint += (
+                f"\n你之前已经发送了以下消息（用户已看到）：\n{sent_text}\n"
+                "请注意衔接，避免重复已发送的内容。"
+            )
+        interrupt_hint += "]"
+
+        # 将打断提示存入新请求的第一条消息的 context_data
+        merged_messages[0].context_data["interrupt_hint"] = interrupt_hint
+
+        # 3. 构建新的合并请求
+        new_request = PendingRequest(
+            session_key=session_key,
+            messages=merged_messages,
+            process_callback=self._process_ai_request,
+        )
+
+        # 4. 重新处理（直接调用，不经过队列，因为当前 worker 就在执行中）
+        _logger.info(
+            f"重新处理请求 (session={session_key}，"
+            f"{len(merged_messages)} 条消息)"
+        )
+        await self._process_ai_request(new_request)
 
     # ---- 消息发送 ----
 

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -201,6 +202,7 @@ class AIChatService:
         last_ref_msg_id: int | None = None,
         image_urls: list[str] | None = None,
         display_name: str | None = None,
+        on_prepared: Callable[[list[dict[str, Any]]], None] | None = None,
     ) -> str:
         """发送多轮对话请求，返回 AI 回复文本（非流式）。
 
@@ -217,6 +219,7 @@ class AIChatService:
             last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（用于跨轮去重）。
             image_urls: 当前触发消息中的图片 URL 列表（可选）。仅在 enable_vision=True 时生效。
             display_name: 会话显示名称（如群名、好友昵称），用于跨会话记忆标识。
+            on_prepared: 可选回调，在 _prepare_chat 完成后调用，传递构建好的 messages 列表。
 
         Returns:
             AI 回复的文本内容。
@@ -228,6 +231,10 @@ class AIChatService:
         # 前置检查失败时 _prepare_chat 返回错误字符串
         if isinstance(prepared, str):
             return prepared
+
+        # 通知调用方 messages 已构建完成
+        if on_prepared:
+            on_prepared(prepared.payload["messages"])
 
         # 4. 调用 API（非流式）
         try:
@@ -270,6 +277,9 @@ class AIChatService:
         image_urls: list[str] | None = None,
         display_name: str | None = None,
         on_message: Callable[[ParsedMessage], Awaitable[None]] | None = None,
+        cancel_event: asyncio.Event | None = None,
+        on_partial: Callable[[str], None] | None = None,
+        on_prepared: Callable[[list[dict[str, Any]]], None] | None = None,
     ) -> str:
         """流式对话请求。
 
@@ -285,6 +295,9 @@ class AIChatService:
             image_urls: 图片 URL 列表。
             display_name: 会话显示名称。
             on_message: 检测到完整 <send_msg> 块时的回调函数。
+            cancel_event: 可选取消信号，被 set 时中止流式接收。
+            on_partial: 可选回调，每次收到增量 delta 后调用，传递当前累积的完整响应。
+            on_prepared: 可选回调，在 _prepare_chat 完成后调用，传递构建好的 messages 列表。
 
         Returns:
             完整的 AI 回复文本（用于日志/调试）。
@@ -295,6 +308,10 @@ class AIChatService:
         )
         if isinstance(prepared, str):
             return prepared
+
+        # 通知调用方 messages 已构建完成
+        if on_prepared:
+            on_prepared(prepared.payload["messages"])
 
         # 启用流式模式
         prepared.payload["stream"] = True
@@ -313,6 +330,11 @@ class AIChatService:
                     return f"[AI 请求失败: HTTP {resp.status}]"
 
                 async for raw_line in resp.content:
+                    # 检查取消信号（在处理每行之前检查，最小化延迟）
+                    if cancel_event and cancel_event.is_set():
+                        logger.info("流式请求被截断器打断，中止接收")
+                        break
+
                     line = raw_line.decode("utf-8").strip()
                     if not line.startswith("data: "):
                         continue
@@ -331,6 +353,11 @@ class AIChatService:
 
                     # 喂入增量解析器
                     new_messages = parser.feed(delta)
+
+                    # 通知调用方当前累积的部分回复
+                    if on_partial:
+                        on_partial(parser.get_full_response())
+
                     if on_message:
                         for msg in new_messages:
                             await on_message(msg)
@@ -345,8 +372,11 @@ class AIChatService:
         # 获取完整回复
         reply = parser.get_full_response()
 
-        # 5. 存入 AI 回复
-        await self._store.add_message(prepared.session_key, "assistant", reply)
+        # 被截断器打断时不存入 AI 回复（不完整的回复不应进入历史）
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        if not cancelled:
+            # 5. 存入 AI 回复
+            await self._store.add_message(prepared.session_key, "assistant", reply)
 
         return reply
 

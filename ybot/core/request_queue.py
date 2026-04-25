@@ -20,6 +20,9 @@ logger = get_logger("RequestQueue")
 # 处理回调类型：接收一个 PendingRequest，返回 Awaitable[None]
 ProcessCallback = Callable[["PendingRequest"], Awaitable[None]]
 
+# 截断判断回调类型：接收 session_key 和新消息
+InterruptCallback = Callable[[str, "QueuedMessage"], Awaitable[None]]
+
 
 @dataclass
 class QueuedMessage:
@@ -81,6 +84,10 @@ class RequestQueue:
 
         self._worker_task: asyncio.Task[None] | None = None
 
+        # 截断器相关状态
+        self._processing_session: str | None = None  # 当前正在处理的 session_key
+        self._interrupt_callback: InterruptCallback | None = None  # 截断判断回调
+
     async def start(self) -> None:
         """启动 worker 协程。必须在事件循环中调用。"""
         self._queue_event = asyncio.Event()
@@ -120,12 +127,21 @@ class RequestQueue:
         - 如果该 session 已有 pending request（定时器未到期），
           将消息合并到 pending，**不重置定时器**。
         - 如果该 session 没有 pending request，创建新的并启动 1 秒定时器。
+        - 如果当前正在处理同一 session 的请求且已注册截断回调，
+          异步触发截断判断。
 
         Args:
             session_key: 会话标识。
             message: 待排队的消息。
             process_callback: 处理回调。
         """
+        # 截断器：如果当前正在处理同一 session 的请求，触发截断判断
+        if (
+            self._processing_session == session_key
+            and self._interrupt_callback is not None
+        ):
+            asyncio.create_task(self._interrupt_callback(session_key, message))
+
         if session_key in self._pending:
             # 合并到已有 pending（定时器不重置）
             self._pending[session_key].messages.append(message)
@@ -201,6 +217,7 @@ class RequestQueue:
                     f"开始处理请求（session={request.session_key}，"
                     f"{len(request.messages)} 条消息）"
                 )
+                self._processing_session = request.session_key  # 标记当前处理的 session
                 try:
                     await request.process_callback(request)
                 except Exception as e:
@@ -208,6 +225,51 @@ class RequestQueue:
                         f"处理请求时发生错误（session={request.session_key}）: {e}",
                         exc_info=True,
                     )
+                finally:
+                    self._processing_session = None  # 清除标记
 
             # 队列已空，清除事件等待下一批
             self._queue_event.clear()
+
+    # ---- 截断器辅助方法 ----
+
+    def set_interrupt_callback(self, callback: InterruptCallback) -> None:
+        """注册截断判断回调。
+
+        当新消息到达且与当前正在处理的 session 相同时，
+        会通过 ``asyncio.create_task`` 异步调用此回调。
+
+        Args:
+            callback: 截断判断回调函数。
+        """
+        self._interrupt_callback = callback
+
+    def drain_pending(self, session_key: str) -> PendingRequest | None:
+        """提取并移除指定 session 的 pending 请求。
+
+        同时取消对应的防抖定时器。
+
+        Args:
+            session_key: 会话标识。
+
+        Returns:
+            被移除的 PendingRequest，如果不存在则返回 None。
+        """
+        timer = self._debounce_timers.pop(session_key, None)
+        if timer:
+            timer.cancel()
+        return self._pending.pop(session_key, None)
+
+    def drain_queued(self, session_key: str) -> PendingRequest | None:
+        """提取并移除队列中指定 session 的请求。
+
+        Args:
+            session_key: 会话标识。
+
+        Returns:
+            被移除的 PendingRequest，如果不存在则返回 None。
+        """
+        for i, req in enumerate(self._queue):
+            if req.session_key == session_key:
+                return self._queue.pop(i)
+        return None
