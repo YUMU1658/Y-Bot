@@ -37,6 +37,7 @@ class WebSocketServer:
         self._event_handler: EventHandler | None = None
         self._bot = CQHttp()
         self._server_task: asyncio.Task | None = None
+        self._shutdown_event: asyncio.Event | None = None
 
         # 注册 aiocqhttp 事件处理器
         # aiocqhttp 内部已通过 asyncio.create_task 派发事件，不会死锁
@@ -75,8 +76,16 @@ class WebSocketServer:
         ):
             logging.getLogger(name).setLevel(logging.WARNING)
 
+        # 创建 shutdown_event 并传入 shutdown_trigger，
+        # 防止 hypercorn 注册自己的信号处理器（在 Windows 上会覆盖
+        # Python 默认的 KeyboardInterrupt 行为，导致 Ctrl+C 失效）。
+        self._shutdown_event = asyncio.Event()
         self._server_task = asyncio.create_task(
-            self._bot.run_task(host=self.host, port=self.port)
+            self._bot.run_task(
+                host=self.host,
+                port=self.port,
+                shutdown_trigger=self._shutdown_event.wait,
+            )
         )
         logger.info(f"WebSocket 服务端已启动，监听 {self.host}:{self.port}")
         logger.info(
@@ -87,6 +96,9 @@ class WebSocketServer:
 
     async def stop(self) -> None:
         """停止 WebSocket 服务端。"""
+        # 先通知 hypercorn 优雅关闭
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
         if self._server_task is not None:
             self._server_task.cancel()
             try:

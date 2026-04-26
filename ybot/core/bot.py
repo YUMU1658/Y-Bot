@@ -126,11 +126,18 @@ class Bot:
         """异步主循环。"""
         self._running = True
 
-        # 注册信号处理（仅 Unix）
+        # 注册信号处理
         loop = asyncio.get_running_loop()
         if sys.platform != "win32":
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, self._signal_handler)
+        else:
+            # Windows 上 asyncio 不支持 add_signal_handler，
+            # 使用 signal.signal 注册同步处理器来设置退出标志。
+            # 注意：这会覆盖 Python 默认的 KeyboardInterrupt 行为，
+            # 因此需要确保 hypercorn 不会再次覆盖（通过传入 shutdown_trigger 实现）。
+            signal.signal(signal.SIGINT, self._win32_signal_handler)
+            signal.signal(signal.SIGTERM, self._win32_signal_handler)
 
         # 启动 AI 服务（需在事件循环中创建 aiohttp 会话）
         await self._conv_store.initialize()
@@ -152,7 +159,15 @@ class Bot:
             await self.shutdown()
 
     def _signal_handler(self) -> None:
-        """处理退出信号。"""
+        """处理退出信号（Unix）。"""
+        self._running = False
+
+    def _win32_signal_handler(self, signum: int, frame: Any) -> None:
+        """处理退出信号（Windows）。
+
+        Windows 上 asyncio 不支持 loop.add_signal_handler，
+        因此使用 signal.signal 注册的同步回调。签名与 signal.signal 要求一致。
+        """
         self._running = False
 
     async def shutdown(self) -> None:
