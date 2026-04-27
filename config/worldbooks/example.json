@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "id": "ybot-example",
+  "name": "示例世界书",
+  "description": "Y-BOT 世界书功能示例，包含各种触发模式的演示条目。默认禁用，启用后可作为参考模板。",
+  "enabled": false,
+  "settings": {
+    "scan_depth": 2,
+    "token_budget": 2048,
+    "recursive_scanning": true,
+    "max_recursion_depth": 3,
+    "case_sensitive": false,
+    "match_whole_words": false
+  },
+  "entries": [
+    {
+      "id": "constant-reminder",
+      "name": "常驻提醒",
+      "comment": "始终注入的条目，适合核心规则补充",
+      "enabled": true,
+      "content": "（这是一条常驻世界书条目示例，始终会被注入到 prompt 中。）",
+      "trigger": {
+        "mode": "constant",
+        "keywords": [],
+        "secondary_keywords": [],
+        "regex": null,
+        "filter_in": null,
+        "filter_out": null
+      },
+      "insertion": {
+        "position": "system_end",
+        "depth": 0,
+        "role": "system",
+        "order": 100
+      },
+      "options": {
+        "constant": true,
+        "disabled": false,
+        "selective": false,
+        "exclude_recursion": false,
+        "prevent_recursion": false,
+        "delay_until_recursion": false,
+        "probability": 100,
+        "cooldown": 0,
+        "group": null,
+        "group_weight": 100,
+        "sticky": 0,
+        "use_group_scoring": false
+      }
+    },
+    {
+      "id": "keyword-example",
+      "name": "关键词触发示例",
+      "comment": "当用户提到'魔法'或'法术'时触发",
+      "enabled": true,
+      "content": "关于魔法体系：本世界的魔法分为元素系、精神系和召唤系三大类...",
+      "trigger": {
+        "mode": "keyword",
+        "keywords": ["魔法", "法术", "咒语"],
+        "secondary_keywords": [],
+        "regex": null,
+        "filter_in": null,
+        "filter_out": null
+      },
+      "insertion": {
+        "position": "system_end",
+        "depth": 0,
+        "role": "system",
+        "order": 200
+      },
+      "options": {
+        "constant": false,
+        "disabled": false,
+        "selective": false,
+        "exclude_recursion": false,
+        "prevent_recursion": false,
+        "delay_until_recursion": false,
+        "probability": 100,
+        "cooldown": 0,
+        "group": null,
+        "group_weight": 100,
+        "sticky": 0,
+        "use_group_scoring": false
+      }
+    },
+    {
+      "id": "regex-example",
+      "name": "正则触发示例",
+      "comment": "匹配日期格式时触发",
+      "enabled": true,
+      "content": "用户提到了日期，请注意当前的时间线设定...",
+      "trigger": {
+        "mode": "regex",
+        "keywords": [],
+        "secondary_keywords": [],
+        "regex": "\\d{4}[年/-]\\d{1,2}[月/-]\\d{1,2}",
+        "filter_in": null,
+        "filter_out": null
+      },
+      "insertion": {
+        "position": "at_depth",
+        "depth": 2,
+        "role": "system",
+        "order": 300
+      },
+      "options": {
+        "constant": false,
+        "disabled": false,
+        "selective": false,
+        "exclude_recursion": true,
+        "prevent_recursion": false,
+        "delay_until_recursion": false,
+        "probability": 100,
+        "cooldown": 0,
+        "group": null,
+        "group_weight": 100,
+        "sticky": 0,
+        "use_group_scoring": false
+      }
+    },
+    {
+      "id": "selective-example",
+      "name": "选择性触发示例",
+      "comment": "需要同时匹配主关键词和次要关键词",
+      "enabled": true,
+      "content": "关于角色A和角色B的关系：他们是...",
+      "trigger": {
+        "mode": "keyword",
+        "keywords": ["角色A", "小明"],
+        "secondary_keywords": ["角色B", "小红", "关系"],
+        "regex": null,
+        "filter_in": null,
+        "filter_out": null
+      },
+      "insertion": {
+        "position": "system_end",
+        "depth": 0,
+        "role": "system",
+        "order": 400
+      },
+      "options": {
+        "constant": false,
+        "disabled": false,
+        "selective": true,
+        "exclude_recursion": false,
+        "prevent_recursion": false,
+        "delay_until_recursion": false,
+        "probability": 100,
+        "cooldown": 0,
+        "group": null,
+        "group_weight": 100,
+        "sticky": 3,
+        "use_group_scoring": false
+      }
+    }
+  ]
+}

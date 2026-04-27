@@ -20,6 +20,7 @@ from ybot.core.config import AIConfig
 from ybot.services.preset import PresetManager
 from ybot.services.reply_parser import ParsedMessage
 from ybot.services.stream_parser import StreamSendMsgParser
+from ybot.services.worldbook import WorldBookService
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger
 
@@ -51,7 +52,12 @@ class AIChatService:
         _session: aiohttp 异步 HTTP 会话。
     """
 
-    def __init__(self, config: AIConfig, store: ConversationStore) -> None:
+    def __init__(
+        self,
+        config: AIConfig,
+        store: ConversationStore,
+        worldbook: WorldBookService | None = None,
+    ) -> None:
         self._config = config
         self._store = store
         self._session: aiohttp.ClientSession | None = None
@@ -60,6 +66,7 @@ class AIChatService:
             preset_name=config.preset_name,
             enabled=config.preset_enabled,
         )
+        self._worldbook = worldbook
 
     async def start(self) -> None:
         """初始化 HTTP 会话。
@@ -166,12 +173,27 @@ class AIChatService:
         # 3.6 更新唤醒时间和显示名称
         await self._store.update_session_meta(session_key, display_name)
 
+        # 3.65 世界书扫描
+        worldbook_entries = None
+        if self._worldbook and self._worldbook.is_enabled():
+            worldbook_entries = self._worldbook.scan_and_collect(
+                current_message=user_message,
+                history=history,
+                session_key=session_key,
+            )
+            if worldbook_entries:
+                logger.debug(
+                    f"世界书激活 {len(worldbook_entries)} 条条目 "
+                    f"(session={session_key})"
+                )
+
         # 3.7 构建最终 messages 列表
         messages = self._preset_manager.build_messages(
             env_header=env_header,
             character_prompt=self._config.system_prompt,
             history=history,
             cross_session_message=cross_session_message,
+            worldbook_entries=worldbook_entries,
         )
 
         # 构建 API 请求参数

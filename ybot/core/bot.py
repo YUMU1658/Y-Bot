@@ -39,6 +39,7 @@ from ybot.services.env_builder import EnvBuilder, MessageFormatter
 from ybot.services.interceptor import InterceptorService
 from ybot.services.message_builder import text_to_segments
 from ybot.services.reply_parser import ParsedMessage, parse_reply
+from ybot.services.worldbook import WorldBookService
 from ybot.storage.chat_log import ChatLogEntry, GroupChatLog
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger, setup_logger
@@ -85,7 +86,20 @@ class Bot:
 
         # 初始化 AI 对话服务
         self._conv_store = ConversationStore()
-        self._ai_chat = AIChatService(config.ai, self._conv_store)
+
+        # 初始化世界书服务
+        self._worldbook: WorldBookService | None = None
+        if config.worldbook.enabled:
+            self._worldbook = WorldBookService(
+                worldbook_dir=config.worldbook.worldbook_dir,
+                enabled_books=config.worldbook.enabled_books,
+                enabled=True,
+            )
+            self._worldbook.load()
+
+        self._ai_chat = AIChatService(
+            config.ai, self._conv_store, worldbook=self._worldbook
+        )
 
         # 初始化 Bot 信息缓存、ENV 构建器、消息格式化器
         self._bot_info = BotInfoService(self._ws_server)

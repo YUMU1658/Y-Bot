@@ -206,38 +206,112 @@ class PresetManager:
         character_prompt: str,
         history: list[dict[str, Any]],
         cross_session_message: str | None = None,
+        worldbook_entries: list[Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """根据预设构建最终请求消息列表。"""
+        """根据预设构建最终请求消息列表。
+
+        Args:
+            worldbook_entries: 已激活的世界书条目列表 (ActivatedEntry)。
+        """
         preset = self.load()
         entries = self._active_entries(preset)
         separator = str(preset.settings.get("separator", "\n\n")) or "\n\n"
 
+        # 收集世界书条目（按位置分组）
+        wb_by_position: dict[str, list[Any]] = {}
+        if worldbook_entries:
+            for act in worldbook_entries:
+                pos = act.entry.insertion.position
+                wb_by_position.setdefault(pos, []).append(act)
+
+        # ---- 构建系统消息 ----
         system_parts = [
             entry.content for entry in entries if entry.position == "system_before"
         ]
+        # 世界书 system_before
+        for act in wb_by_position.get("system_before", []):
+            system_parts.append(act.entry.content)
+
         if env_header:
             system_parts.append(env_header)
+
         system_parts.extend(
             entry.content for entry in entries if entry.position == "system_after"
         )
+        # 世界书 system_after
+        for act in wb_by_position.get("system_after", []):
+            system_parts.append(act.entry.content)
+
         if character_prompt:
             system_parts.append(character_prompt)
+
+        # 世界书 system_end（角色设定之后）
+        for act in wb_by_position.get("system_end", []):
+            system_parts.append(act.entry.content)
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": separator.join(system_parts)}
         ]
 
+        # ---- messages_start ----
         messages.extend(self._entry_messages(entries, "messages_start"))
+        for act in wb_by_position.get("messages_start", []):
+            messages.append({"role": act.entry.insertion.role, "content": act.entry.content})
 
         if cross_session_message:
             messages.append({"role": "user", "content": cross_session_message})
 
         messages.extend(copy.deepcopy(history))
 
-        self._wrap_last_user(messages, entries, separator)
-        self._insert_assistant_entries(messages, entries, "assistant_before")
-        self._insert_assistant_entries(messages, entries, "assistant_after")
+        # ---- user_before / user_after ----
+        # 合并 preset 和世界书的 user_before/user_after 条目
+        merged_entries_for_wrap = list(entries)
+        for pos in ("user_before", "user_after"):
+            for act in wb_by_position.get(pos, []):
+                merged_entries_for_wrap.append(
+                    PresetEntry(
+                        id=f"wb-{act.entry.id}",
+                        name=act.entry.name,
+                        enabled=True,
+                        role=act.entry.insertion.role,
+                        position=pos,
+                        order=act.entry.insertion.order,
+                        content=act.entry.content,
+                    )
+                )
+        # 重新排序合并后的条目
+        merged_entries_for_wrap.sort(
+            key=lambda item: (item.position, item.order, item.id)
+        )
+        self._wrap_last_user(messages, merged_entries_for_wrap, separator)
+
+        # ---- assistant_before / assistant_after ----
+        merged_entries_for_assistant = list(entries)
+        for pos in ("assistant_before", "assistant_after"):
+            for act in wb_by_position.get(pos, []):
+                merged_entries_for_assistant.append(
+                    PresetEntry(
+                        id=f"wb-{act.entry.id}",
+                        name=act.entry.name,
+                        enabled=True,
+                        role=act.entry.insertion.role,
+                        position=pos,
+                        order=act.entry.insertion.order,
+                        content=act.entry.content,
+                    )
+                )
+        self._insert_assistant_entries(messages, merged_entries_for_assistant, "assistant_before")
+        self._insert_assistant_entries(messages, merged_entries_for_assistant, "assistant_after")
+
+        # ---- messages_end ----
         messages.extend(self._entry_messages(entries, "messages_end"))
+        for act in wb_by_position.get("messages_end", []):
+            messages.append({"role": act.entry.insertion.role, "content": act.entry.content})
+
+        # ---- at_depth 插入（在完整消息列表构建完成后） ----
+        at_depth_entries = wb_by_position.get("at_depth", [])
+        if at_depth_entries:
+            self._insert_at_depth(messages, at_depth_entries)
 
         return messages
 
@@ -412,6 +486,42 @@ class PresetManager:
         """拼接文本前后缀，避免多余空段。"""
         parts = [part for part in [before, text, after] if part]
         return separator.join(parts)
+
+    @staticmethod
+    def _insert_at_depth(
+        messages: list[dict[str, Any]],
+        at_depth_entries: list[Any],
+    ) -> None:
+        """按 depth 值将世界书条目插入到消息列表的指定深度。
+
+        depth=0 表示插入到消息列表最末尾，
+        depth=N 表示从末尾往前数 N 条消息之前插入。
+        """
+        # 按 depth 分组，同 depth 内按 order 排序
+        by_depth: dict[int, list[Any]] = {}
+        for act in at_depth_entries:
+            d = act.entry.insertion.depth
+            by_depth.setdefault(d, []).append(act)
+
+        # 按 depth 从大到小处理（先插入深处的，避免索引偏移）
+        for depth in sorted(by_depth.keys(), reverse=True):
+            acts = sorted(by_depth[depth], key=lambda a: a.entry.insertion.order)
+            new_msgs = [
+                {"role": a.entry.insertion.role, "content": a.entry.content}
+                for a in acts
+            ]
+
+            if depth <= 0:
+                # depth=0: 插入到末尾
+                messages.extend(new_msgs)
+            else:
+                # depth=N: 从末尾往前数 N 条消息之前插入
+                insert_pos = len(messages) - depth
+                if insert_pos < 1:
+                    # 不能插到系统消息之前，最早插到索引 1
+                    insert_pos = 1
+                for offset, msg in enumerate(new_msgs):
+                    messages.insert(insert_pos + offset, msg)
 
     def _wrap_multimodal_content(
         self,
