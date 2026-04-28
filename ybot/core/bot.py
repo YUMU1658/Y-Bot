@@ -81,6 +81,7 @@ class Bot:
         self._ws_server = WebSocketServer(
             host=config.server.host,
             port=config.server.port,
+            access_token=config.server.access_token,
         )
         self._ws_server.set_event_handler(self._on_raw_event)
 

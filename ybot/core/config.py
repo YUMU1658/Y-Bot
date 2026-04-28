@@ -18,6 +18,7 @@ DEFAULT_CONFIG_TOML = """\
 [server]
 host = "localhost"
 port = 21050
+access_token = ""                              # WS 鉴权 Token（留空则不启用鉴权；需与 OneBot 客户端配置一致）
 
 [bot]
 log_level = "INFO"    # DEBUG / INFO / WARNING / ERROR
@@ -59,6 +60,7 @@ class ServerConfig:
 
     host: str = "localhost"
     port: int = 8080
+    access_token: str = ""
 
 
 @dataclass
@@ -155,6 +157,7 @@ class Config:
         server = ServerConfig(
             host=server_data.get("host", "localhost"),
             port=server_data.get("port", 8080),
+            access_token=server_data.get("access_token", ""),
         )
         bot = BotConfig(
             log_level=bot_data.get("log_level", "INFO"),

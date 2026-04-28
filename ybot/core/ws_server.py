@@ -31,11 +31,11 @@ class WebSocketServer:
         port: 监听端口。
     """
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, access_token: str = "") -> None:
         self.host = host
         self.port = port
         self._event_handler: EventHandler | None = None
-        self._bot = CQHttp()
+        self._bot = CQHttp(access_token=access_token or None)
         self._server_task: asyncio.Task | None = None
         self._shutdown_event: asyncio.Event | None = None
 

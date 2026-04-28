@@ -1,6 +1,7 @@
 [server]
 host = "localhost"
 port = 21050
+access_token = ""                              # WS 鉴权 Token（留空则不启用鉴权；需与 OneBot 客户端配置一致）
 
 [bot]
 log_level = "INFO"    # DEBUG / INFO / WARNING / ERROR
