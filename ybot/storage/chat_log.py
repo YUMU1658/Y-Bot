@@ -1,7 +1,11 @@
-"""群聊消息日志缓冲区。
+"""聊天日志缓冲区。
 
-收集群内所有消息（包括 bot 自身发出的），
-在 bot 被触发时提供近期聊天记录作为上下文。
+提供两个缓冲区：
+- GroupChatLog: 群聊消息日志，收集群内所有消息（包括 bot 自身发出的），
+  在 bot 被触发时提供近期聊天记录作为上下文。
+- PokeLog: 戳一戳记录缓冲区，按 session_key 索引，
+  在私聊消息触发 AI 回复时提供近期戳一戳记录作为参考上下文。
+
 纯内存实现，使用 deque 自动淘汰旧记录。
 """
 
@@ -143,3 +147,50 @@ class GroupChatLog:
                 if entry.message_id == message_id:
                     return entry.recalled
         return False
+
+
+@dataclass
+class PokeLogEntry:
+    """单条戳一戳记录。
+
+    Attributes:
+        timestamp: Unix 时间戳（来自 event.time）。
+        formatted_text: 已格式化的互动文案（如"张三(111) 戳了戳 你"）。
+    """
+
+    timestamp: float
+    formatted_text: str
+
+
+class PokeLog:
+    """戳一戳记录缓冲区。
+
+    按 session_key 索引，每个会话维护一个有序的戳一戳记录列表。
+    纯内存实现，使用 deque 自动淘汰旧记录。
+
+    设计用于私聊场景：戳一戳事件写入缓冲区，当用户发送私聊消息
+    触发 AI 回复时，通过 ``drain()`` 取出并清空缓冲区，
+    避免同一条戳一戳在多次对话中重复出现。
+    """
+
+    def __init__(self, buffer_size: int = 20) -> None:
+        self._buffer_size = buffer_size
+        self._logs: dict[str, deque[PokeLogEntry]] = {}
+
+    def add(self, session_key: str, entry: PokeLogEntry) -> None:
+        """添加一条戳一戳记录。"""
+        if session_key not in self._logs:
+            self._logs[session_key] = deque(maxlen=self._buffer_size)
+        self._logs[session_key].append(entry)
+
+    def drain(self, session_key: str) -> list[PokeLogEntry]:
+        """取出并清空指定会话的所有戳一戳记录。
+
+        返回按时间升序排列的记录列表。取出后缓冲区清空，
+        避免同一条戳一戳在多次唤醒中重复出现。
+        """
+        if session_key not in self._logs:
+            return []
+        entries = list(self._logs[session_key])
+        self._logs[session_key].clear()
+        return entries

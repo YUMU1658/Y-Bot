@@ -41,7 +41,7 @@ from ybot.services.interceptor import InterceptorService
 from ybot.services.message_builder import text_to_segments
 from ybot.services.reply_parser import ParsedMessage, parse_reply
 from ybot.services.worldbook import WorldBookService
-from ybot.storage.chat_log import ChatLogEntry, GroupChatLog
+from ybot.storage.chat_log import ChatLogEntry, GroupChatLog, PokeLog, PokeLogEntry
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger, setup_logger
 
@@ -120,6 +120,9 @@ class Bot:
 
         # 初始化群聊消息日志缓冲区
         self._chat_log = GroupChatLog(buffer_size=config.ai.context_buffer)
+
+        # 初始化戳一戳记录缓冲区（私聊用）
+        self._poke_log = PokeLog(buffer_size=20)
 
         # 初始化防抖 + 单线程请求队列
         self._request_queue = RequestQueue(debounce_seconds=1.0)
@@ -303,6 +306,14 @@ class Bot:
                         )
                     # 格式化消息
                     formatted_msg = self._msg_formatter.format_private_message(e, text)
+                    # 拉取近期戳一戳记录作为参考上下文
+                    poke_entries = self._poke_log.drain(session_key)
+                    if poke_entries:
+                        context_msg = MessageFormatter.build_poke_context_message(
+                            poke_entries, formatted_msg
+                        )
+                    else:
+                        context_msg = formatted_msg
                     # 提取当前触发消息中的图片 URL
                     image_urls = self._extract_image_urls(e)
                     # 构建跨会话记忆的显示名称
@@ -323,6 +334,7 @@ class Bot:
                             "type": "private",
                             "session_key": session_key,
                             "env_header": env_header,
+                            "context_msg": context_msg,
                             "image_urls": image_urls,
                             "user_id": e.user_id,
                             "display_name": display_name,
@@ -427,7 +439,8 @@ class Bot:
                 user_message = data["context_msg"]
                 last_ref_id = data["last_ref_id"]
             else:
-                user_message = last_msg.formatted_msg
+                # 私聊：使用 context_msg（包含戳一戳上下文），回退到 formatted_msg
+                user_message = data.get("context_msg", last_msg.formatted_msg)
                 last_ref_id = None
         else:
             if msg_type == "group":
@@ -438,7 +451,10 @@ class Bot:
                 user_message = "\n".join(parts)
                 last_ref_id = data["last_ref_id"]
             else:
-                parts = [m.formatted_msg for m in request.messages]
+                # 私聊：第一条使用 context_msg（含戳一戳上下文），后续用 formatted_msg
+                first_data = request.messages[0].context_data
+                parts = [first_data.get("context_msg", request.messages[0].formatted_msg)]
+                parts.extend(m.formatted_msg for m in request.messages[1:])
                 user_message = "\n".join(parts)
                 last_ref_id = None
 
@@ -571,8 +587,8 @@ class Bot:
                 user_message = data["context_msg"]
                 last_ref_id = data["last_ref_id"]
             else:
-                # 私聊没有 context_msg / last_ref_id
-                user_message = last_msg.formatted_msg
+                # 私聊：使用 context_msg（包含戳一戳上下文），回退到 formatted_msg
+                user_message = data.get("context_msg", last_msg.formatted_msg)
                 last_ref_id = None
         else:
             # ---- 多条消息合并 ----
@@ -587,8 +603,10 @@ class Bot:
                 # last_ref_id 使用最后一条消息的值
                 last_ref_id = data["last_ref_id"]
             else:
-                # 私聊：拼接所有 formatted_msg
-                parts = [m.formatted_msg for m in request.messages]
+                # 私聊：第一条使用 context_msg（含戳一戳上下文），后续用 formatted_msg
+                first_data = request.messages[0].context_data
+                parts = [first_data.get("context_msg", request.messages[0].formatted_msg)]
+                parts.extend(m.formatted_msg for m in request.messages[1:])
                 user_message = "\n".join(parts)
                 last_ref_id = None
 
@@ -1168,6 +1186,14 @@ class Bot:
                 entry_type="poke",
             )
             self._chat_log.add(entry)
+        else:
+            # 私聊：写入 PokeLog
+            session_key = f"friend_{event.user_id}"
+            poke_entry = PokeLogEntry(
+                timestamp=event.time,
+                formatted_text=text,
+            )
+            self._poke_log.add(session_key, poke_entry)
 
     def _log_request_event(self, event: RequestEvent) -> None:
         """记录请求事件日志。"""
