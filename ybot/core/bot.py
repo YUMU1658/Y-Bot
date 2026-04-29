@@ -24,6 +24,7 @@ from ybot.models.event import (
     MessageEvent,
     MetaEvent,
     NoticeEvent,
+    PokeNoticeEvent,
     PrivateMessageEvent,
     RequestEvent,
     parse_event,
@@ -46,6 +47,16 @@ from ybot.utils.logger import get_logger, setup_logger
 
 # 模块级 logger，用于 _send_reply 等非实例方法的日志
 _logger = get_logger("Bot")
+
+# 戳一戳伪 message_id 计数器（负数，避免与正整数的真实 message_id 冲突）
+_poke_id_counter: int = 0
+
+
+def _next_poke_id() -> int:
+    """生成下一个戳一戳伪 message_id（递减负数）。"""
+    global _poke_id_counter
+    _poke_id_counter -= 1
+    return _poke_id_counter
 
 
 @dataclass
@@ -326,6 +337,9 @@ class Bot:
                 self._msg_logger.info(f"[{e.message_type}] 用户:{e.user_id} | {text}")
             case MetaEvent() as e:
                 self._log_meta_event(e)
+            case PokeNoticeEvent() as e:
+                self._log_notice_event(e)
+                await self._handle_poke(e)
             case NoticeEvent() as e:
                 self._log_notice_event(e)
                 # 处理撤回通知，标记 ChatLog 中对应消息
@@ -1095,6 +1109,65 @@ class Bot:
             msg_id = event.raw_data.get("message_id")
             if msg_id is not None:
                 self._chat_log.mark_recalled(int(msg_id))
+
+    async def _handle_poke(self, event: PokeNoticeEvent) -> None:
+        """处理戳一戳事件，群聊时写入 ChatLog，私聊时仅记录日志。
+
+        1. 通过 BotInfoService 获取戳者和被戳者的昵称
+        2. 若被戳者是 bot 自身，使用"你"代替昵称（LLM 视角）
+        3. 构建互动文案文本
+        4. 群聊：创建 ChatLogEntry（entry_type="poke"），写入 GroupChatLog
+        5. 不提交到请求队列，不触发 AI 回复
+
+        Args:
+            event: 戳一戳通知事件。
+        """
+        group_id = event.group_id
+        login_info = await self._bot_info.get_login_info()
+        is_bot = event.user_id == login_info.user_id
+        target_is_bot = event.target_id == login_info.user_id
+
+        # 获取戳者昵称
+        if group_id:
+            poker_member = await self._bot_info.get_member_info(group_id, event.user_id)
+            poker_name = poker_member.card or poker_member.nickname or str(event.user_id)
+        else:
+            # 私聊：无群成员信息，使用 raw_data 中的 sender_nick 或 QQ 号
+            poker_name = event.raw_data.get("sender_nick", "") or str(event.user_id)
+
+        # 获取被戳者显示名
+        if target_is_bot:
+            # 被戳者是 bot 自身 → 用"你"（LLM 第二人称视角）
+            target_display = "你"
+        elif group_id:
+            target_member = await self._bot_info.get_member_info(group_id, event.target_id)
+            target_name = target_member.card or target_member.nickname or str(event.target_id)
+            target_display = f"{target_name}({event.target_id})"
+        else:
+            target_display = str(event.target_id)
+
+        # 构建文案文本
+        poke_text = event.poke_text or "戳了戳"
+        text = f"{poker_name}({event.user_id}) {poke_text} {target_display}"
+
+        # 群聊：写入 GroupChatLog
+        if group_id:
+            entry = ChatLogEntry(
+                message_id=_next_poke_id(),
+                group_id=group_id,
+                user_id=event.user_id,
+                nickname=poker_member.nickname or str(event.user_id),
+                card=poker_member.card or "",
+                role="",
+                level="",
+                title="",
+                is_friend=False,
+                timestamp=event.time,
+                text=text,
+                is_bot=is_bot,
+                entry_type="poke",
+            )
+            self._chat_log.add(entry)
 
     def _log_request_event(self, event: RequestEvent) -> None:
         """记录请求事件日志。"""

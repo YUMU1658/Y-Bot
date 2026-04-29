@@ -85,6 +85,16 @@ class NoticeEvent(Event):
 
 
 @dataclass
+class PokeNoticeEvent(NoticeEvent):
+    """戳一戳通知事件（群聊/私聊通用）。"""
+
+    group_id: int = 0      # 群号（私聊时为 0）
+    user_id: int = 0       # 戳者
+    target_id: int = 0     # 被戳者
+    poke_text: str = ""    # 互动文案（如"戳了戳"、"抱了抱XX并揉了揉"）
+
+
+@dataclass
 class RequestEvent(Event):
     """请求事件。"""
 
@@ -121,9 +131,13 @@ def parse_event(data: dict[str, Any]) -> Event:
         case "message" | "message_sent":
             return _parse_message_event(data, base_kwargs)
         case "notice":
+            notice_type = data.get("notice_type", "")
+            sub_type = data.get("sub_type", "")
+            if notice_type == "notify" and sub_type == "poke":
+                return _parse_poke_event(data, base_kwargs)
             return NoticeEvent(
                 **base_kwargs,
-                notice_type=data.get("notice_type", ""),
+                notice_type=notice_type,
             )
         case "request":
             return RequestEvent(
@@ -177,3 +191,75 @@ def _parse_message_event(
             return PrivateMessageEvent(**common_kwargs)
         case _:
             return MessageEvent(**common_kwargs)
+
+
+def _parse_poke_text(data: dict[str, Any]) -> str:
+    """从戳一戳事件数据中解析互动文案。
+
+    解析优先级：
+    1. ``raw_data`` 顶层的 ``action`` 字段（部分 OneBot 实现如 go-cqhttp 扩展）
+    2. ``raw_info`` 列表中提取（NapCat 扩展）
+    3. 默认 "戳了戳"
+
+    ``suffix`` 字段（如果存在）会追加到动作词后面。
+
+    Args:
+        data: 原始事件 JSON 数据。
+
+    Returns:
+        互动文案字符串，如 "戳了戳"、"抱了抱 并揉了揉"。
+    """
+    action = ""
+    suffix = ""
+
+    # 优先级 1：顶层 action 字段
+    if data.get("action"):
+        action = str(data["action"])
+        suffix = str(data.get("suffix", ""))
+    else:
+        # 优先级 2：从 raw_info 提取
+        raw_info = data.get("raw_info")
+        if isinstance(raw_info, list):
+            for item in raw_info:
+                if not isinstance(item, dict):
+                    continue
+                # NapCat 的 raw_info 中可能包含 txt 字段作为动作词
+                txt = item.get("txt", "")
+                if txt and not action:
+                    action = txt
+        elif isinstance(raw_info, dict):
+            action = raw_info.get("action", "") or raw_info.get("txt", "")
+            suffix = raw_info.get("suffix", "")
+
+    # 优先级 3：默认文案
+    if not action:
+        action = "戳了戳"
+
+    if suffix:
+        return f"{action} {suffix}".strip()
+    return action
+
+
+def _parse_poke_event(
+    data: dict[str, Any],
+    base_kwargs: dict[str, Any],
+) -> PokeNoticeEvent:
+    """解析戳一戳通知事件。
+
+    Args:
+        data: 原始事件 JSON 数据。
+        base_kwargs: 公共字段字典。
+
+    Returns:
+        PokeNoticeEvent 实例。
+    """
+    poke_text = _parse_poke_text(data)
+
+    return PokeNoticeEvent(
+        **base_kwargs,
+        notice_type=data.get("notice_type", "notify"),
+        group_id=data.get("group_id", 0),
+        user_id=data.get("user_id", 0),
+        target_id=data.get("target_id", 0),
+        poke_text=poke_text,
+    )

@@ -362,10 +362,14 @@ class MessageFormatter:
         与 ``format_group_message`` 风格一致，但使用 ChatLogEntry 中
         已预取的元数据，无需异步 API 调用。
 
-        输出格式::
+        普通消息输出格式::
 
             [#msg_id HH:MM:SS QQ昵称(QQ号) → 群昵称 | 等级/头衔/身份 ★友]
             消息内容
+
+        戳一戳输出格式::
+
+            [💢戳一戳 HH:MM:SS] 张三(12345) 戳了戳 李四(67890)
 
         Args:
             entry: 聊天记录条目。
@@ -376,6 +380,10 @@ class MessageFormatter:
         # 时间戳转为 HH:MM:SS
         dt = datetime.fromtimestamp(entry.timestamp, tz=_CST)
         time_str = dt.strftime("%H:%M:%S")
+
+        # 戳一戳专用格式
+        if entry.entry_type == "poke":
+            return f"[💢戳一戳 {time_str}] {entry.text}"
 
         header_parts = [
             f"#{entry.message_id} {time_str} {entry.nickname}({entry.user_id})"

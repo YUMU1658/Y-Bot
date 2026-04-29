@@ -34,6 +34,7 @@ class ChatLogEntry:
     text: str  # 消息内容表示（含富媒体占位标记）
     is_bot: bool  # 是否为 bot 自身发送的消息
     recalled: bool = False  # 是否已被撤回
+    entry_type: str = "message"  # "message" | "poke"
 
 
 class GroupChatLog:
