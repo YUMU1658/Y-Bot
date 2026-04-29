@@ -51,6 +51,10 @@ api_base = ""                              # 截断器模型 API 地址（留空
 api_key = ""                               # 截断器模型 API 密钥（留空则复用 [ai] 的 api_key）
 model = "gpt-4o-mini"                      # 截断器使用的模型（建议轻量快速模型）
 timeout = 8.0                              # 截断器判断超时时间（秒），超时视为不打断
+
+[poke]
+cooldown = 10                              # 对同一用户的戳一戳冷却时间（秒），默认 10
+daily_limit = 200                          # 每日戳一戳总次数上限，默认 200
 """
 
 
@@ -105,6 +109,14 @@ class InterceptorConfig:
 
 
 @dataclass
+class PokeConfig:
+    """戳一戳配置。"""
+
+    cooldown: int = 10  # 对同一用户的冷却时间（秒）
+    daily_limit: int = 200  # 每日总次数上限
+
+
+@dataclass
 class WorldBookConfig:
     """世界书配置。"""
 
@@ -122,6 +134,7 @@ class Config:
     ai: AIConfig = field(default_factory=AIConfig)
     interceptor: InterceptorConfig = field(default_factory=InterceptorConfig)
     worldbook: WorldBookConfig = field(default_factory=WorldBookConfig)
+    poke: PokeConfig = field(default_factory=PokeConfig)
 
     @classmethod
     def load(cls, config_path: str | Path = "config/config.toml") -> Config:
@@ -153,6 +166,7 @@ class Config:
         ai_data = data.get("ai", {})
         interceptor_data = data.get("interceptor", {})
         worldbook_data = data.get("worldbook", {})
+        poke_data = data.get("poke", {})
 
         server = ServerConfig(
             host=server_data.get("host", "localhost"),
@@ -191,8 +205,12 @@ class Config:
             worldbook_dir=worldbook_data.get("worldbook_dir", "config/worldbooks"),
             enabled_books=worldbook_data.get("enabled_books", []),
         )
+        poke = PokeConfig(
+            cooldown=poke_data.get("cooldown", 10),
+            daily_limit=poke_data.get("daily_limit", 200),
+        )
 
-        return cls(server=server, bot=bot, ai=ai, interceptor=interceptor, worldbook=worldbook)
+        return cls(server=server, bot=bot, ai=ai, interceptor=interceptor, worldbook=worldbook, poke=poke)
 
     @staticmethod
     def _generate_default(path: Path) -> None:

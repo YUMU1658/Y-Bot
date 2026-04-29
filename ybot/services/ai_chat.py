@@ -18,8 +18,8 @@ import aiohttp
 
 from ybot.core.config import AIConfig
 from ybot.services.preset import PresetManager
-from ybot.services.reply_parser import ParsedMessage
-from ybot.services.stream_parser import StreamSendMsgParser
+from ybot.services.reply_parser import ParsedAction
+from ybot.services.stream_parser import StreamActionParser
 from ybot.services.worldbook import WorldBookService
 from ybot.storage.conversation import ConversationStore
 from ybot.utils.logger import get_logger
@@ -298,7 +298,7 @@ class AIChatService:
         last_ref_msg_id: int | None = None,
         image_urls: list[str] | None = None,
         display_name: str | None = None,
-        on_message: Callable[[ParsedMessage], Awaitable[None]] | None = None,
+        on_action: Callable[[ParsedAction], Awaitable[None]] | None = None,
         cancel_event: asyncio.Event | None = None,
         on_partial: Callable[[str], None] | None = None,
         on_prepared: Callable[[list[dict[str, Any]]], None] | None = None,
@@ -316,7 +316,7 @@ class AIChatService:
             last_ref_msg_id: 参考聊天记录去重边界。
             image_urls: 图片 URL 列表。
             display_name: 会话显示名称。
-            on_message: 检测到完整 <send_msg> 块时的回调函数。
+            on_action: 检测到完整 <send_msg> 或 <poke> 块时的回调函数。
             cancel_event: 可选取消信号，被 set 时中止流式接收。
             on_partial: 可选回调，每次收到增量 delta 后调用，传递当前累积的完整响应。
             on_prepared: 可选回调，在 _prepare_chat 完成后调用，传递构建好的 messages 列表。
@@ -337,7 +337,7 @@ class AIChatService:
 
         # 启用流式模式
         prepared.payload["stream"] = True
-        parser = StreamSendMsgParser()
+        parser = StreamActionParser()
 
         # 4. 流式调用 API
         try:
@@ -374,15 +374,15 @@ class AIChatService:
                         continue
 
                     # 喂入增量解析器
-                    new_messages = parser.feed(delta)
+                    new_actions = parser.feed(delta)
 
                     # 通知调用方当前累积的部分回复
                     if on_partial:
                         on_partial(parser.get_full_response())
 
-                    if on_message:
-                        for msg in new_messages:
-                            await on_message(msg)
+                    if on_action:
+                        for action in new_actions:
+                            await on_action(action)
 
         except aiohttp.ClientError as e:
             logger.error(f"AI API 流式网络错误: {e}")
@@ -401,6 +401,19 @@ class AIChatService:
             await self._store.add_message(prepared.session_key, "assistant", reply)
 
         return reply
+
+    async def update_last_assistant_reply(
+        self, session_key: str, new_content: str
+    ) -> None:
+        """更新数据库中最后一条 assistant 回复的内容。
+
+        用于在 poke 标签执行后，将原始 <poke> 标签替换为执行结果文案。
+
+        Args:
+            session_key: 会话标识。
+            new_content: 替换后的回复内容。
+        """
+        await self._store.update_last_assistant_message(session_key, new_content)
 
     @staticmethod
     def _build_cross_session_message(

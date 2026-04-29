@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -39,7 +40,14 @@ from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
 from ybot.services.interceptor import InterceptorService
 from ybot.services.message_builder import text_to_segments
-from ybot.services.reply_parser import ParsedMessage, parse_reply
+from ybot.services.poke_limiter import PokeLimiter
+from ybot.services.reply_parser import (
+    ParsedAction,
+    ParsedMessage,
+    ParsedPoke,
+    parse_reply,
+    parse_reply_actions,
+)
 from ybot.services.worldbook import WorldBookService
 from ybot.storage.chat_log import ChatLogEntry, GroupChatLog, PokeLog, PokeLogEntry
 from ybot.storage.conversation import ConversationStore
@@ -123,6 +131,12 @@ class Bot:
 
         # 初始化戳一戳记录缓冲区（私聊用）
         self._poke_log = PokeLog(buffer_size=20)
+
+        # 初始化戳一戳速率限制器
+        self._poke_limiter = PokeLimiter(
+            cooldown=config.poke.cooldown,
+            daily_limit=config.poke.daily_limit,
+        )
 
         # 初始化防抖 + 单线程请求队列
         self._request_queue = RequestQueue(debounce_seconds=1.0)
@@ -368,39 +382,102 @@ class Bot:
         reply: str,
         *,
         send_func: Callable[[str, int | None], Awaitable[None]],
+        poke_func: Callable[[int], Awaitable[tuple[bool, str]]],
+        group_id: int | None = None,
         interval: float = 1.0,
-    ) -> None:
-        """解析 AI 回复并按序发送消息。
+    ) -> str:
+        """解析 AI 回复并按序发送消息/执行戳一戳。
 
-        从 AI 回复中提取 <send_msg> 标签内的消息，按顺序逐条发送，
-        每条消息之间间隔指定时间。
+        从 AI 回复中提取 <send_msg> 和 <poke> 标签，按出现顺序逐个处理，
+        每个动作之间间隔指定时间。
+
+        戳一戳执行后，将结果（成功的互动文案或失败原因）替换到回复文本中，
+        返回替换后的文本用于数据库存储。
 
         Args:
             reply: AI 原始回复文本。
             send_func: 发送单条消息的异步函数（接受消息文本和可选的 reply_id）。
-            interval: 多条消息之间的发送间隔（秒），默认 1.0。
+            poke_func: 执行戳一戳的异步函数（接受 target_id，返回 (成功, 文案/原因)）。
+            group_id: 群号（群聊时提供，用于写入 ChatLog）。
+            interval: 动作之间的间隔（秒），默认 1.0。
+
+        Returns:
+            替换了戳一戳结果后的回复文本。
         """
-        messages = parse_reply(reply)
+        actions = parse_reply_actions(reply)
 
-        if not messages:
-            _logger.warning("AI 回复中未包含 <send_msg> 标签，跳过发送")
+        if not actions:
+            _logger.warning("AI 回复中未包含有效标签，跳过发送")
             _logger.debug(f"原始回复: {reply[:200]}")
-            return
+            return reply
 
-        for i, msg in enumerate(messages):
-            await send_func(msg.content, msg.reply_id)
-            # 最后一条消息后不需要等待
-            if i < len(messages) - 1:
+        # 收集戳一戳替换结果：(原始标签文本, 替换文本)
+        poke_replacements: list[tuple[str, str]] = []
+
+        for i, action in enumerate(actions):
+            if isinstance(action, ParsedMessage):
+                await send_func(action.content, action.reply_id)
+            elif isinstance(action, ParsedPoke):
+                success, text = await poke_func(action.target_id)
+                # 构建原始标签的正则匹配文本
+                original_tag = f'<poke target="{action.target_id}"/>'
+                if success:
+                    replacement = f"[💢戳一戳] {text}"
+                    # 群聊：写入 ChatLog
+                    if group_id is not None:
+                        await self._write_poke_chat_log(
+                            group_id=group_id, poke_text=text
+                        )
+                else:
+                    replacement = f"[戳一戳失败: {text}]"
+                poke_replacements.append((original_tag, replacement))
+
+            # 最后一个动作后不需要等待
+            if i < len(actions) - 1:
                 await asyncio.sleep(interval)
+
+        # 替换回复文本中的 poke 标签
+        transformed_reply = reply
+        for original, replacement in poke_replacements:
+            transformed_reply = transformed_reply.replace(original, replacement, 1)
+
+        return transformed_reply
+
+    async def _write_poke_chat_log(
+        self, *, group_id: int, poke_text: str
+    ) -> None:
+        """将 bot 主动发起的戳一戳写入群聊 ChatLog。
+
+        Args:
+            group_id: 群号。
+            poke_text: 互动文案（如 "Bot名(QQ号) 戳了戳 目标QQ号"）。
+        """
+        login_info = await self._bot_info.get_login_info()
+        entry = ChatLogEntry(
+            message_id=_next_poke_id(),
+            group_id=group_id,
+            user_id=login_info.user_id,
+            nickname=login_info.nickname or str(login_info.user_id),
+            card="",
+            role="",
+            level="",
+            title="",
+            is_friend=False,
+            timestamp=time.time(),
+            text=poke_text,
+            is_bot=True,
+            entry_type="poke",
+        )
+        self._chat_log.add(entry)
 
     # ---- 流式请求处理 ----
 
     async def _process_ai_request_stream(self, request: PendingRequest) -> None:
         """流式模式的 AI 请求处理。
 
-        使用 asyncio.Queue 作为消息管道（生产者-消费者模式）：
-        - 生产者：LLM 流式回调将 ParsedMessage 放入队列
-        - 消费者：sender_worker 从队列取消息，按 1 秒间隔发送
+        使用 asyncio.Queue 作为动作管道（生产者-消费者模式）：
+        - 生产者：LLM 流式回调将 ParsedAction 放入队列
+        - 消费者：sender_worker 从队列取动作，按 1 秒间隔执行
 
         与 ``_process_ai_request()`` 共享前置的上下文构建逻辑，
         仅在 API 调用和消息发送部分不同。
@@ -422,17 +499,19 @@ class Bot:
             if urls:
                 all_image_urls.extend(urls)
 
-        # 构建发送函数
+        # 构建发送函数和 poke 函数
         if msg_type == "group":
             group_id = data["group_id"]
             send_func = lambda msg, rid=None, gid=group_id: self.send_group_msg(
                 gid, msg, rid
             )
+            poke_func = lambda tid, gid=group_id: self.send_poke(tid, gid)
         else:
             user_id = data["user_id"]
             send_func = lambda msg, rid=None, uid=user_id: self.send_private_msg(
                 uid, msg, rid
             )
+            poke_func = lambda tid: self.send_poke(tid, None)
 
         if len(request.messages) == 1:
             if msg_type == "group":
@@ -470,12 +549,15 @@ class Bot:
             self._active_tasks[session_key] = active_task
 
         # ---- 流式特有逻辑：生产者-消费者模式 ----
-        msg_queue: asyncio.Queue[ParsedMessage | None] = asyncio.Queue()
+        action_queue: asyncio.Queue[ParsedAction | None] = asyncio.Queue()
         sent_messages: list[str] = []  # 追踪已发送的消息
+        # 收集戳一戳替换结果：(原始标签文本, 替换文本)
+        poke_replacements: list[tuple[str, str]] = []
+        stream_group_id = data.get("group_id") if msg_type == "group" else None
 
-        async def on_message(msg: ParsedMessage) -> None:
-            """流式回调：将完整消息放入队列。"""
-            await msg_queue.put(msg)
+        async def on_action(action: ParsedAction) -> None:
+            """流式回调：将完整动作放入队列。"""
+            await action_queue.put(action)
 
         def on_partial(full_response: str) -> None:
             """部分回复更新回调：同步更新 active_task 的 partial_response。"""
@@ -488,19 +570,33 @@ class Bot:
                 active_task.context_messages = messages
 
         async def sender_worker() -> None:
-            """消费者：从队列取消息，延迟 1 秒后发送。"""
+            """消费者：从队列取动作，延迟 1 秒后执行。"""
             while True:
-                msg = await msg_queue.get()
-                if msg is None:  # 哨兵值，表示流结束
+                action = await action_queue.get()
+                if action is None:  # 哨兵值，表示流结束
                     break
                 await asyncio.sleep(1.0)
                 # 检查是否被打断（避免在打断后继续发送）
                 if active_task and active_task.cancel_event.is_set():
                     break
-                await send_func(msg.content, msg.reply_id)
-                sent_messages.append(msg.content)
 
-        # 并发运行：LLM 流式请求 + 消息发送
+                if isinstance(action, ParsedMessage):
+                    await send_func(action.content, action.reply_id)
+                    sent_messages.append(action.content)
+                elif isinstance(action, ParsedPoke):
+                    success, text = await poke_func(action.target_id)
+                    original_tag = f'<poke target="{action.target_id}"/>'
+                    if success:
+                        replacement = f"[💢戳一戳] {text}"
+                        if stream_group_id is not None:
+                            await self._write_poke_chat_log(
+                                group_id=stream_group_id, poke_text=text
+                            )
+                    else:
+                        replacement = f"[戳一戳失败: {text}]"
+                    poke_replacements.append((original_tag, replacement))
+
+        # 并发运行：LLM 流式请求 + 动作执行
         sender_task = asyncio.create_task(sender_worker())
 
         try:
@@ -511,16 +607,16 @@ class Bot:
                 last_ref_msg_id=last_ref_id,
                 image_urls=all_image_urls or None,
                 display_name=data.get("display_name"),
-                on_message=on_message,
+                on_action=on_action,
                 cancel_event=active_task.cancel_event if active_task else None,
                 on_partial=on_partial if active_task else None,
                 on_prepared=on_prepared if active_task else None,
             )
         finally:
             # 无论成功还是异常，都发送哨兵值确保 sender_worker 退出
-            await msg_queue.put(None)
+            await action_queue.put(None)
 
-        await sender_task  # 等待所有消息发送完毕
+        await sender_task  # 等待所有动作执行完毕
 
         # ---- 截断器：检查是否被打断 ----
         if active_task:
@@ -534,9 +630,19 @@ class Bot:
                 )
                 return
 
-        # 检查流式响应中是否包含 <send_msg> 标签
-        if reply and not parse_reply(reply):
-            _logger.warning("AI 回复中未包含 <send_msg> 标签，跳过发送")
+        # 替换回复文本中的 poke 标签并更新数据库存储
+        if poke_replacements and reply:
+            transformed_reply = reply
+            for original, replacement in poke_replacements:
+                transformed_reply = transformed_reply.replace(original, replacement, 1)
+            # 更新数据库中的 AI 回复（替换 poke 标签为结果文案）
+            await self._ai_chat.update_last_assistant_reply(
+                session_key, transformed_reply
+            )
+
+        # 检查流式响应中是否包含有效标签
+        if reply and not parse_reply_actions(reply):
+            _logger.warning("AI 回复中未包含有效标签，跳过发送")
             _logger.debug(f"原始回复: {reply[:200]}")
 
     # ---- 请求队列回调 ----
@@ -569,17 +675,19 @@ class Bot:
             if urls:
                 all_image_urls.extend(urls)
 
-        # 构建发送函数
+        # 构建发送函数和 poke 函数
         if msg_type == "group":
             group_id = data["group_id"]
             send_func = lambda msg, rid=None, gid=group_id: self.send_group_msg(
                 gid, msg, rid
             )
+            poke_func = lambda tid, gid=group_id: self.send_poke(tid, gid)
         else:
             user_id = data["user_id"]
             send_func = lambda msg, rid=None, uid=user_id: self.send_private_msg(
                 uid, msg, rid
             )
+            poke_func = lambda tid: self.send_poke(tid, None)
 
         if len(request.messages) == 1:
             # ---- 单条消息：直接使用已预处理的数据 ----
@@ -647,7 +755,19 @@ class Bot:
                 await self._reprocess_after_interrupt(request, session_key)
                 return
 
-        await self._send_reply(reply, send_func=send_func)
+        poke_group_id = data.get("group_id") if msg_type == "group" else None
+        transformed_reply = await self._send_reply(
+            reply,
+            send_func=send_func,
+            poke_func=poke_func,
+            group_id=poke_group_id,
+        )
+
+        # 如果有 poke 标签被替换，更新数据库中的 AI 回复
+        if transformed_reply != reply:
+            await self._ai_chat.update_last_assistant_reply(
+                session_key, transformed_reply
+            )
 
     # ---- 截断器回调与重新处理 ----
 
@@ -803,6 +923,66 @@ class Bot:
                 "message": segments,
             },
         )
+
+    async def send_poke(
+        self, target_id: int, group_id: int | None = None
+    ) -> tuple[bool, str]:
+        """发送戳一戳动作。
+
+        Args:
+            target_id: 被戳用户的 QQ 号。
+            group_id: 群号（群聊时提供，私聊时为 None）。
+
+        Returns:
+            (成功与否, 互动文案或失败原因)
+        """
+        # 1. 速率限制检查
+        reject_reason = self._poke_limiter.check(target_id)
+        if reject_reason:
+            return False, reject_reason
+
+        # 2. 调用 OneBot API（优先使用 group_poke/friend_poke，失败后降级到 send_poke）
+        try:
+            if group_id:
+                try:
+                    await self._ws_server.call_api(
+                        "group_poke",
+                        {"group_id": group_id, "user_id": target_id},
+                        timeout=5.0,
+                    )
+                except Exception:
+                    # 降级到 send_poke
+                    await self._ws_server.call_api(
+                        "send_poke",
+                        {"group_id": group_id, "user_id": target_id},
+                        timeout=5.0,
+                    )
+            else:
+                try:
+                    await self._ws_server.call_api(
+                        "friend_poke",
+                        {"user_id": target_id},
+                        timeout=5.0,
+                    )
+                except Exception:
+                    # 降级到 send_poke
+                    await self._ws_server.call_api(
+                        "send_poke",
+                        {"user_id": target_id},
+                        timeout=5.0,
+                    )
+        except Exception as e:
+            return False, f"戳一戳发送失败: {e}"
+
+        # 3. 记录成功
+        self._poke_limiter.record(target_id)
+
+        # 4. 构建互动文案
+        login_info = await self._bot_info.get_login_info()
+        bot_name = login_info.nickname or str(login_info.user_id)
+        poke_text = f"{bot_name}({login_info.user_id}) 戳了戳 {target_id}"
+
+        return True, poke_text
 
     # ---- 辅助方法 ----
 

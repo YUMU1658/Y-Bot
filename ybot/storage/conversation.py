@@ -350,3 +350,34 @@ class ConversationStore:
             (session_id,),
         )
         await self._db.commit()
+
+    async def update_last_assistant_message(
+        self, session_key: str, new_content: str
+    ) -> None:
+        """更新指定会话最后一条 assistant 消息的内容。
+
+        用于在 poke 标签执行后，将原始 <poke> 标签替换为执行结果文案。
+
+        Args:
+            session_key: 会话标识。
+            new_content: 替换后的消息内容。
+        """
+        assert self._db is not None, "ConversationStore 未初始化"
+
+        cursor = await self._db.execute(
+            "SELECT m.id FROM messages m "
+            "JOIN sessions s ON m.session_id = s.id "
+            "WHERE s.session_key = ? AND m.role = 'assistant' "
+            "ORDER BY m.created_at DESC LIMIT 1",
+            (session_key,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return
+
+        msg_id: int = row[0]
+        await self._db.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            (new_content, msg_id),
+        )
+        await self._db.commit()

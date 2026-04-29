@@ -34,3 +34,7 @@ api_base = ""                              # 截断器模型 API 地址（留空
 api_key = ""                               # 截断器模型 API 密钥（留空则复用 [ai] 的 api_key）
 model = "gpt-4o-mini"                      # 截断器使用的模型（建议轻量快速模型）
 timeout = 8.0                              # 截断器判断超时时间（秒），超时视为不打断
+
+[poke]
+cooldown = 10                              # 对同一用户的戳一戳冷却时间（秒），默认 10
+daily_limit = 200                          # 每日戳一戳总次数上限，默认 200
