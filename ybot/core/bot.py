@@ -1129,13 +1129,14 @@ class Bot:
                 self._chat_log.mark_recalled(int(msg_id))
 
     async def _handle_poke(self, event: PokeNoticeEvent) -> None:
-        """处理戳一戳事件，群聊时写入 ChatLog，私聊时仅记录日志。
+        """处理戳一戳事件，群聊时写入 ChatLog，私聊时写入 PokeLog。
 
         1. 通过 BotInfoService 获取戳者和被戳者的昵称
-        2. 若被戳者是 bot 自身，使用"你"代替昵称（LLM 视角）
+        2. 若被戳者是 bot 自身，使用"你(QQ号)"代替昵称（LLM 视角，附带 QQ 号防伪造）
         3. 构建互动文案文本
         4. 群聊：创建 ChatLogEntry（entry_type="poke"），写入 GroupChatLog
-        5. 不提交到请求队列，不触发 AI 回复
+        5. 私聊：创建 PokeLogEntry，写入 PokeLog
+        6. 不提交到请求队列，不触发 AI 回复
 
         Args:
             event: 戳一戳通知事件。
@@ -1155,8 +1156,8 @@ class Bot:
 
         # 获取被戳者显示名
         if target_is_bot:
-            # 被戳者是 bot 自身 → 用"你"（LLM 第二人称视角）
-            target_display = "你"
+            # 被戳者是 bot 自身 → 用"你(QQ号)"（LLM 第二人称视角，附带 QQ 号防伪造）
+            target_display = f"你({login_info.user_id})"
         elif group_id:
             target_member = await self._bot_info.get_member_info(group_id, event.target_id)
             target_name = target_member.card or target_member.nickname or str(event.target_id)
