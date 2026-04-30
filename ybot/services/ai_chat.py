@@ -29,6 +29,9 @@ logger = get_logger("AI")
 # 北京时间 UTC+8
 _CST = timezone(timedelta(hours=8))
 
+# tool_calls 最大循环次数（防止无限循环）
+_MAX_TOOL_ROUNDS = 5
+
 
 @dataclass
 class _PreparedChat:
@@ -57,6 +60,7 @@ class AIChatService:
         config: AIConfig,
         store: ConversationStore,
         worldbook: WorldBookService | None = None,
+        tool_registry: Any | None = None,
     ) -> None:
         self._config = config
         self._store = store
@@ -67,6 +71,7 @@ class AIChatService:
             enabled=config.preset_enabled,
         )
         self._worldbook = worldbook
+        self._tool_registry = tool_registry
 
     async def start(self) -> None:
         """初始化 HTTP 会话。
@@ -231,6 +236,7 @@ class AIChatService:
         流程：
         1-3.7. 前置逻辑（由 _prepare_chat 完成）
         4. 调用 OpenAI API（非流式，等待完整响应）
+        4.5. 如果响应包含 tool_calls，执行工具并循环请求
         5. 将 AI 回复存入数据库
         6. 返回回复文本
 
@@ -254,12 +260,53 @@ class AIChatService:
         if isinstance(prepared, str):
             return prepared
 
+        # 注入 tools 参数（仅当 tool_registry 存在且有注册的工具时）
+        if self._tool_registry is not None and self._tool_registry.has_tools():
+            prepared.payload["tools"] = self._tool_registry.get_openai_tools()
+
         # 通知调用方 messages 已构建完成
         if on_prepared:
             on_prepared(prepared.payload["messages"])
 
-        # 4. 调用 API（非流式）
+        # 4. 调用 API（非流式），支持 tool_calls 循环
         try:
+            reply = await self._chat_with_tools(prepared)
+        except aiohttp.ClientError as e:
+            logger.error(f"AI API 网络错误: {e}")
+            return "[AI 网络错误]"
+        except Exception as e:
+            logger.error(f"AI 调用时发生未知错误: {e}")
+            return "[AI 调用失败]"
+
+        if reply.startswith("["):
+            # 错误消息，不存入数据库
+            return reply
+
+        # 5. 存入 AI 回复
+        await self._store.add_message(prepared.session_key, "assistant", reply)
+
+        # 6. 返回
+        return reply
+
+    async def _chat_with_tools(self, prepared: _PreparedChat) -> str:
+        """执行 API 调用，处理 tool_calls 循环。
+
+        当 LLM 响应包含 tool_calls 时，执行工具并将结果追加到
+        messages 列表中，然后重新请求 LLM，直到 LLM 返回最终文本回复
+        或达到最大循环次数。
+
+        Args:
+            prepared: 已准备好的 API 调用数据。
+
+        Returns:
+            最终的 AI 回复文本。
+
+        Raises:
+            aiohttp.ClientError: 网络错误。
+        """
+        messages = prepared.payload["messages"]
+
+        for round_idx in range(_MAX_TOOL_ROUNDS):
             async with self._session.post(  # type: ignore[union-attr]
                 prepared.url, json=prepared.payload, headers=prepared.headers
             ) as resp:
@@ -271,22 +318,170 @@ class AIChatService:
                     return f"[AI 请求失败: HTTP {resp.status}]"
 
                 data = await resp.json()
-                reply: str = data["choices"][0]["message"]["content"]
-        except aiohttp.ClientError as e:
-            logger.error(f"AI API 网络错误: {e}")
-            return "[AI 网络错误]"
+
+            try:
+                choice = data["choices"][0]
+                message = choice["message"]
+            except (KeyError, IndexError) as e:
+                logger.error(f"AI API 响应格式异常: {e}")
+                return "[AI 响应格式异常]"
+
+            tool_calls = message.get("tool_calls")
+
+            if not tool_calls:
+                # 无 tool_calls，提取最终回复
+                reply = message.get("content", "")
+                if reply is None:
+                    reply = ""
+                return reply
+
+            # 有 tool_calls，需要执行工具
+            if self._tool_registry is None:
+                # 不应发生：有 tools 参数但没有 registry
+                logger.warning("收到 tool_calls 但 tool_registry 为 None")
+                reply = message.get("content", "")
+                return reply if reply else "[AI 响应异常: 未预期的 tool_calls]"
+
+            logger.info(
+                f"收到 {len(tool_calls)} 个 tool_calls "
+                f"(round={round_idx + 1})"
+            )
+
+            # 将 assistant 的 tool_calls 消息追加到 messages（保持原样）
+            assistant_msg: dict[str, Any] = {"role": "assistant"}
+            if message.get("content"):
+                assistant_msg["content"] = message["content"]
+            else:
+                assistant_msg["content"] = None
+            assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+
+            # 执行每个 tool_call 并构建 tool result messages
+            tool_results: list[tuple[dict[str, Any], str]] = []
+            for tc in tool_calls:
+                tc_id = tc.get("id", "")
+                func = tc.get("function", {})
+                func_name = func.get("name", "")
+                func_args = func.get("arguments", "{}")
+
+                logger.debug(
+                    f"执行工具: {func_name}(id={tc_id}, args={func_args[:100]})"
+                )
+
+                result = await self._tool_registry.execute_tool_call(
+                    func_name, func_args, prepared.session_key
+                )
+
+                # 构建 tool role message
+                tool_msg: dict[str, Any] = {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": result.message,
+                }
+                messages.append(tool_msg)
+                tool_results.append((tc, result.message))
+
+            # 将工具调用记录存入数据库
+            await self._store_tool_messages(
+                prepared.session_key, assistant_msg, tool_results
+            )
+
+            # 更新 payload 中的 messages 并继续循环
+            prepared.payload["messages"] = messages
+
+        # 达到最大循环次数
+        logger.warning(
+            f"tool_calls 循环达到上限 ({_MAX_TOOL_ROUNDS} 轮)，"
+            "强制返回最后一轮结果"
+        )
+        # 移除 tools 参数，强制 LLM 生成文本回复
+        prepared.payload.pop("tools", None)
+        async with self._session.post(  # type: ignore[union-attr]
+            prepared.url, json=prepared.payload, headers=prepared.headers
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logger.error(
+                    f"AI API 最终请求失败 (HTTP {resp.status}): {error_text[:200]}"
+                )
+                return f"[AI 请求失败: HTTP {resp.status}]"
+            data = await resp.json()
+
+        try:
+            reply = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as e:
-            logger.error(f"AI API 响应格式异常: {e}")
+            logger.error(f"AI API 最终响应格式异常: {e}")
             return "[AI 响应格式异常]"
-        except Exception as e:
-            logger.error(f"AI 调用时发生未知错误: {e}")
-            return "[AI 调用失败]"
 
-        # 5. 存入 AI 回复
-        await self._store.add_message(prepared.session_key, "assistant", reply)
+        return reply or ""
 
-        # 6. 返回
-        return reply
+    async def _store_tool_messages(
+        self,
+        session_key: str,
+        assistant_msg: dict[str, Any],
+        tool_results: list[tuple[dict[str, Any], str]],
+    ) -> None:
+        """将工具调用记录（assistant tool_calls + tool results）存入数据库。
+
+        Args:
+            session_key: 会话标识。
+            assistant_msg: 包含 tool_calls 的 assistant 消息。
+            tool_results: (tool_call_dict, result_message) 元组列表。
+        """
+        # 存储 assistant 的 tool_calls 消息
+        tool_calls_data = json.dumps({
+            "content": assistant_msg.get("content"),
+            "tool_calls": assistant_msg["tool_calls"],
+        }, ensure_ascii=False)
+        await self._store.add_message(
+            session_key, "assistant", tool_calls_data,
+            content_type="tool_calls",
+        )
+
+        # 存储每个 tool result
+        for tc, result_message in tool_results:
+            func = tc.get("function", {})
+            tool_result_data = json.dumps({
+                "tool_call_id": tc.get("id", ""),
+                "name": func.get("name", ""),
+                "content": result_message,
+            }, ensure_ascii=False)
+            await self._store.add_message(
+                session_key, "tool", tool_result_data,
+                content_type="tool_result",
+            )
+
+    @staticmethod
+    def _accumulate_tool_call_deltas(
+        accumulated: list[dict[str, Any]], deltas: list[dict[str, Any]]
+    ) -> None:
+        """将 SSE delta 中的 tool_calls 增量累积到列表中。
+
+        SSE 流式模式下，tool_calls 以增量方式出现在 delta.tool_calls 中，
+        需要按 index 累积每个 tool_call 的 id、function.name、function.arguments。
+
+        Args:
+            accumulated: 累积的 tool_calls 列表（就地修改）。
+            deltas: 本次 SSE delta 中的 tool_calls 增量列表。
+        """
+        for tc_delta in deltas:
+            idx = tc_delta.get("index", 0)
+            # 扩展列表以容纳新的 index
+            while len(accumulated) <= idx:
+                accumulated.append({
+                    "id": "", "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+            # 累积字段
+            if "id" in tc_delta:
+                accumulated[idx]["id"] = tc_delta["id"]
+            if "type" in tc_delta:
+                accumulated[idx]["type"] = tc_delta["type"]
+            func_delta = tc_delta.get("function", {})
+            if "name" in func_delta:
+                accumulated[idx]["function"]["name"] += func_delta["name"]
+            if "arguments" in func_delta:
+                accumulated[idx]["function"]["arguments"] += func_delta["arguments"]
 
     # ---- 流式对话 ----
 
@@ -308,6 +503,7 @@ class AIChatService:
         与 chat() 共享前置逻辑，但 API 调用使用 stream=True。
         每当检测到完整的 <send_msg> 块时，通过 on_message 回调通知。
         完整回复在流结束后一次性存入数据库，与非流式行为一致。
+        支持工具调用：当 LLM 返回 tool_calls 时，执行工具并重新请求。
 
         Args:
             session_key: 会话标识。
@@ -331,58 +527,200 @@ class AIChatService:
         if isinstance(prepared, str):
             return prepared
 
+        # 注入 tools 参数（与 chat() 一致）
+        if self._tool_registry is not None and self._tool_registry.has_tools():
+            prepared.payload["tools"] = self._tool_registry.get_openai_tools()
+
         # 通知调用方 messages 已构建完成
         if on_prepared:
             on_prepared(prepared.payload["messages"])
 
-        # 启用流式模式
-        prepared.payload["stream"] = True
+        messages = prepared.payload["messages"]
         parser = StreamActionParser()
+        cancelled = False
 
-        # 4. 流式调用 API
+        # 4. 流式调用 API，支持 tool_calls 循环
         try:
-            async with self._session.post(  # type: ignore[union-attr]
-                prepared.url, json=prepared.payload, headers=prepared.headers
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(
-                        f"AI API 流式请求失败 (HTTP {resp.status}): {error_text[:200]}"
-                    )
-                    return f"[AI 请求失败: HTTP {resp.status}]"
+            for round_idx in range(_MAX_TOOL_ROUNDS):
+                prepared.payload["stream"] = True
+                prepared.payload["messages"] = messages
 
-                async for raw_line in resp.content:
-                    # 检查取消信号（在处理每行之前检查，最小化延迟）
+                # 本轮累积的 tool_calls 和文本内容
+                accumulated_tool_calls: list[dict[str, Any]] = []
+                assistant_content = ""
+
+                # 检查取消信号（在工具轮次之间检查）
+                if cancel_event and cancel_event.is_set():
+                    logger.info("流式请求在工具轮次间被截断器打断")
+                    cancelled = True
+                    break
+
+                async with self._session.post(  # type: ignore[union-attr]
+                    prepared.url, json=prepared.payload, headers=prepared.headers
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(
+                            f"AI API 流式请求失败 (HTTP {resp.status}): {error_text[:200]}"
+                        )
+                        return f"[AI 请求失败: HTTP {resp.status}]"
+
+                    async for raw_line in resp.content:
+                        # 检查取消信号
+                        if cancel_event and cancel_event.is_set():
+                            logger.info("流式请求被截断器打断，中止接收")
+                            cancelled = True
+                            break
+
+                        line = raw_line.decode("utf-8").strip()
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk["choices"][0]["delta"]
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+
+                        # 处理 content delta
+                        content = delta.get("content", "")
+                        if content:
+                            assistant_content += content
+                            new_actions = parser.feed(content)
+
+                            if on_partial:
+                                on_partial(parser.get_full_response())
+
+                            if on_action:
+                                for action in new_actions:
+                                    await on_action(action)
+
+                        # 处理 tool_calls delta
+                        tc_deltas = delta.get("tool_calls")
+                        if tc_deltas:
+                            self._accumulate_tool_call_deltas(
+                                accumulated_tool_calls, tc_deltas
+                            )
+
+                # 被取消时退出循环
+                if cancelled:
+                    break
+
+                # SSE 流结束，检查是否有 tool_calls
+                if not accumulated_tool_calls:
+                    break  # 纯文本回复，退出循环
+
+                # 有 tool_calls，执行工具
+                if self._tool_registry is None:
+                    break
+
+                logger.info(
+                    f"流式模式收到 {len(accumulated_tool_calls)} 个 tool_calls "
+                    f"(round={round_idx + 1})"
+                )
+
+                # 构建 assistant 消息（含 tool_calls）
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": assistant_content or None,
+                    "tool_calls": accumulated_tool_calls,
+                }
+                messages.append(assistant_msg)
+
+                # 执行工具并追加 tool result
+                tool_results: list[tuple[dict[str, Any], str]] = []
+                for tc in accumulated_tool_calls:
+                    # 检查取消信号（在工具执行之间检查）
                     if cancel_event and cancel_event.is_set():
-                        logger.info("流式请求被截断器打断，中止接收")
+                        logger.info("工具执行过程中被截断器打断")
+                        cancelled = True
                         break
 
-                    line = raw_line.decode("utf-8").strip()
-                    if not line.startswith("data: "):
-                        continue
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
+                    tc_id = tc.get("id", "")
+                    func = tc.get("function", {})
+                    func_name = func.get("name", "")
+                    func_args = func.get("arguments", "{}")
 
-                    try:
-                        chunk = json.loads(data_str)
-                        delta = chunk["choices"][0]["delta"].get("content", "")
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
+                    logger.debug(
+                        f"流式模式执行工具: {func_name}(id={tc_id}, args={func_args[:100]})"
+                    )
 
-                    if not delta:
-                        continue
+                    result = await self._tool_registry.execute_tool_call(
+                        func_name, func_args, prepared.session_key
+                    )
 
-                    # 喂入增量解析器
-                    new_actions = parser.feed(delta)
+                    tool_msg: dict[str, Any] = {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": result.message,
+                    }
+                    messages.append(tool_msg)
+                    tool_results.append((tc, result.message))
 
-                    # 通知调用方当前累积的部分回复
-                    if on_partial:
-                        on_partial(parser.get_full_response())
+                if cancelled:
+                    # 被取消时不存储不完整的工具调用记录
+                    break
 
-                    if on_action:
-                        for action in new_actions:
-                            await on_action(action)
+                # 将工具调用记录存入数据库
+                await self._store_tool_messages(
+                    prepared.session_key, assistant_msg, tool_results
+                )
+
+                # 重置 parser 以准备接收下一轮的文本回复
+                parser = StreamActionParser()
+
+                # 继续循环，重新请求 LLM
+            else:
+                # 达到最大循环次数，移除 tools 参数强制文本回复
+                logger.warning(
+                    f"流式 tool_calls 循环达到上限 ({_MAX_TOOL_ROUNDS} 轮)，"
+                    "强制返回最后一轮结果"
+                )
+                prepared.payload.pop("tools", None)
+                prepared.payload["stream"] = True
+                prepared.payload["messages"] = messages
+                parser = StreamActionParser()
+
+                async with self._session.post(  # type: ignore[union-attr]
+                    prepared.url, json=prepared.payload, headers=prepared.headers
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(
+                            f"AI API 最终流式请求失败 (HTTP {resp.status}): {error_text[:200]}"
+                        )
+                        return f"[AI 请求失败: HTTP {resp.status}]"
+
+                    async for raw_line in resp.content:
+                        if cancel_event and cancel_event.is_set():
+                            cancelled = True
+                            break
+
+                        line = raw_line.decode("utf-8").strip()
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data_str)
+                            content = chunk["choices"][0]["delta"].get("content", "")
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+
+                        if not content:
+                            continue
+
+                        new_actions = parser.feed(content)
+                        if on_partial:
+                            on_partial(parser.get_full_response())
+                        if on_action:
+                            for action in new_actions:
+                                await on_action(action)
 
         except aiohttp.ClientError as e:
             logger.error(f"AI API 流式网络错误: {e}")
@@ -395,7 +733,6 @@ class AIChatService:
         reply = parser.get_full_response()
 
         # 被截断器打断时不存入 AI 回复（不完整的回复不应进入历史）
-        cancelled = cancel_event is not None and cancel_event.is_set()
         if not cancelled:
             # 5. 存入 AI 回复
             await self._store.add_message(prepared.session_key, "assistant", reply)
@@ -452,7 +789,18 @@ class AIChatService:
 
             # 直接拼接原始消息内容
             for msg in messages:
-                content = msg["content"]
+                role = msg.get("role", "")
+
+                # 跳过工具调用相关的中间消息（对跨会话记忆无意义）
+                if role == "tool":
+                    continue
+                if role == "assistant" and "tool_calls" in msg:
+                    # assistant tool_calls 消息，跳过（工具调用细节不需要跨会话展示）
+                    continue
+
+                content = msg.get("content", "")
+                if content is None:
+                    continue
                 if isinstance(content, list):
                     # multimodal 消息，提取文本部分
                     text_parts = [
@@ -462,7 +810,7 @@ class AIChatService:
                     ]
                     content = "\n".join(text_parts)
 
-                if msg["role"] == "assistant":
+                if role == "assistant":
                     lines.append(f"[BOT回复]\n{content}")
                 else:
                     lines.append(content)

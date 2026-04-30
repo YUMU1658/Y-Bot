@@ -134,10 +134,11 @@ class ConversationStore:
 
         Args:
             session_key: 会话标识（如 ``friend_12345``、``group_67890`` 或 ``temp_11111_22222``）。
-            role: 消息角色（``user`` / ``assistant``）。
-            content: 消息文本内容。当 content_type 为 ``multimodal`` 时，应为 JSON 字符串。
+            role: 消息角色（``user`` / ``assistant`` / ``tool``）。
+            content: 消息文本内容。当 content_type 为 ``multimodal``、``tool_calls``
+                或 ``tool_result`` 时，应为 JSON 字符串。
             last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（仅 role=user 时有意义）。
-            content_type: 内容类型（``text`` 或 ``multimodal``）。
+            content_type: 内容类型（``text`` / ``multimodal`` / ``tool_calls`` / ``tool_result``）。
         """
         assert self._db is not None, "ConversationStore 未初始化"
 
@@ -180,13 +181,17 @@ class ConversationStore:
         解析为列表，并将其中的 ``image_url`` 元素替换为文本占位符 ``[图片(历史)]``，
         避免回放过期 URL 和浪费 token。
 
+        对于 ``content_type="tool_calls"`` 的消息，还原为包含 ``tool_calls`` 键的
+        assistant 消息。对于 ``content_type="tool_result"`` 的消息，还原为 ``role="tool"``
+        的消息。返回前会调用 ``_trim_orphan_tool_messages()`` 修剪截断导致的不完整序列。
+
         Args:
             session_key: 会话标识。
             limit: 最大返回消息数。
 
         Returns:
             按时间升序排列的消息列表，每条为
-            ``{"role": "user"|"assistant", "content": "..." | [...]}``。
+            ``{"role": "user"|"assistant"|"tool", "content": "..." | [...]}``。
         """
         assert self._db is not None, "ConversationStore 未初始化"
 
@@ -207,7 +212,28 @@ class ConversationStore:
         result: list[dict[str, Any]] = []
         for r in rows:
             role, content, content_type = r[0], r[1], r[2]
-            if content_type == "multimodal":
+            if content_type == "tool_calls":
+                # 还原为 assistant + tool_calls 格式
+                try:
+                    data = json.loads(content)
+                    msg: dict[str, Any] = {"role": "assistant", "content": data.get("content")}
+                    msg["tool_calls"] = data["tool_calls"]
+                    result.append(msg)
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    # 解析失败时降级为纯文本
+                    result.append({"role": role, "content": content})
+            elif content_type == "tool_result":
+                # 还原为 tool role 消息
+                try:
+                    data = json.loads(content)
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": data["tool_call_id"],
+                        "content": data["content"],
+                    })
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    result.append({"role": role, "content": content})
+            elif content_type == "multimodal":
                 try:
                     content_list = json.loads(content)
                     # 将 image_url 元素替换为文本占位符
@@ -223,7 +249,50 @@ class ConversationStore:
                     result.append({"role": role, "content": content})
             else:
                 result.append({"role": role, "content": content})
+
+        # 修剪截断导致的不完整工具调用序列
+        result = self._trim_orphan_tool_messages(result)
         return result
+
+    @staticmethod
+    def _trim_orphan_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """修剪历史开头不完整的工具调用序列。
+
+        当 max_history 截断导致 tool_calls 和 tool_result 不成对时，
+        移除开头的孤立消息，确保发送给 API 的消息序列合法。
+
+        Args:
+            messages: 按时间升序排列的消息列表。
+
+        Returns:
+            修剪后的消息列表。
+        """
+        start = 0
+        while start < len(messages):
+            msg = messages[start]
+            role = msg.get("role", "")
+            if role == "tool":
+                # 孤立的 tool result（缺少前面的 assistant tool_calls），跳过
+                start += 1
+                continue
+            if role == "assistant" and "tool_calls" in msg:
+                # assistant tool_calls 消息，检查后续是否有完整的 tool results
+                expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+                found_ids: set[str] = set()
+                j = start + 1
+                while j < len(messages) and messages[j].get("role") == "tool":
+                    tid = messages[j].get("tool_call_id", "")
+                    if tid:
+                        found_ids.add(tid)
+                    j += 1
+                if expected_ids == found_ids:
+                    break  # 完整的工具调用序列，保留
+                else:
+                    start = j  # 不完整，跳过整个序列
+                    continue
+            break  # 普通 user/assistant 消息，保留
+
+        return messages[start:] if start > 0 else messages
 
     async def get_last_ref_msg_id(self, session_key: str) -> int | None:
         """获取指定会话最近一条 user 消息的 last_ref_msg_id。

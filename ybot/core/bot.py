@@ -51,6 +51,8 @@ from ybot.services.reply_parser import (
 from ybot.services.worldbook import WorldBookService
 from ybot.storage.chat_log import ChatLogEntry, GroupChatLog, PokeLog, PokeLogEntry
 from ybot.storage.conversation import ConversationStore
+from ybot.tools import ToolRegistry
+from ybot.tools.recall_msg import RecallMsgTool
 from ybot.utils.logger import get_logger, setup_logger
 
 # 模块级 logger，用于 _send_reply 等非实例方法的日志
@@ -104,7 +106,7 @@ class Bot:
         )
         self._ws_server.set_event_handler(self._on_raw_event)
 
-        # 初始化 AI 对话服务
+        # 初始化对话存储
         self._conv_store = ConversationStore()
 
         # 初始化世界书服务
@@ -116,10 +118,6 @@ class Bot:
                 enabled=True,
             )
             self._worldbook.load()
-
-        self._ai_chat = AIChatService(
-            config.ai, self._conv_store, worldbook=self._worldbook
-        )
 
         # 初始化 Bot 信息缓存、ENV 构建器、消息格式化器
         self._bot_info = BotInfoService(self._ws_server)
@@ -136,6 +134,22 @@ class Bot:
         self._poke_limiter = PokeLimiter(
             cooldown=config.poke.cooldown,
             daily_limit=config.poke.daily_limit,
+        )
+
+        # 初始化工具注册中心（仅当配置启用时）
+        self._tool_registry: ToolRegistry | None = None
+        if config.tools.enabled:
+            self._tool_registry = ToolRegistry(
+                ws_server=self._ws_server,
+                bot_info=self._bot_info,
+                chat_log=self._chat_log,
+            )
+            self._tool_registry.register(RecallMsgTool())
+
+        # 初始化 AI 对话服务（注入工具注册中心）
+        self._ai_chat = AIChatService(
+            config.ai, self._conv_store, worldbook=self._worldbook,
+            tool_registry=self._tool_registry,
         )
 
         # 初始化防抖 + 单线程请求队列
