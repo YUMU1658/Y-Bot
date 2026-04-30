@@ -369,7 +369,7 @@ class Bot:
             case NoticeEvent() as e:
                 self._log_notice_event(e)
                 # 处理撤回通知，标记 ChatLog 中对应消息
-                self._handle_recall(e)
+                await self._handle_recall(e)
             case RequestEvent() as e:
                 self._log_request_event(e)
             case _:
@@ -1248,14 +1248,14 @@ class Bot:
 
         # 检查该消息是否在 ChatLog 中被标记为已撤回
         try:
-            is_recalled = self._chat_log.is_recalled(int(msg_id))
+            recall_hint = self._chat_log.get_recall_hint(int(msg_id))
         except (ValueError, TypeError):
-            is_recalled = False
+            recall_hint = ""
 
-        if is_recalled:
+        if recall_hint:
             return (
                 f"[回复:#{msg_id} ← {nickname}({user_id}) {time_str}"
-                f' | ⚠已撤回 | "{reply_content}"]'
+                f' | ⚠{recall_hint} | "{reply_content}"]'
             )
 
         return (
@@ -1301,12 +1301,62 @@ class Bot:
 
         self._notice_logger.info(f"{event.notice_type}{extra_info}")
 
-    def _handle_recall(self, event: NoticeEvent) -> None:
+    async def _handle_recall(self, event: NoticeEvent) -> None:
         """处理撤回通知，标记 GroupChatLog 中对应消息为已撤回。"""
-        if event.notice_type in ("group_recall", "friend_recall"):
-            msg_id = event.raw_data.get("message_id")
-            if msg_id is not None:
-                self._chat_log.mark_recalled(int(msg_id))
+        if event.notice_type not in ("group_recall", "friend_recall"):
+            return
+
+        msg_id = event.raw_data.get("message_id")
+        if msg_id is None:
+            return
+
+        hint = await self._build_recall_hint(event)
+        self._chat_log.mark_recalled(int(msg_id), hint)
+
+    async def _build_recall_hint(self, event: NoticeEvent) -> str:
+        """根据撤回事件构建人类可读的撤回提示。
+
+        场景：
+        - 好友撤回: "对方撤回了这条消息"
+        - 自己撤回: "张三撤回了这条消息"
+        - 管理员撤回他人: "管理员李四撤回了这条消息"
+        - 管理员撤回 bot: "管理员李四撤回了你的这条消息"
+        - 降级: "已撤回"
+        """
+        if event.notice_type == "friend_recall":
+            return "对方撤回了这条消息"
+
+        # group_recall
+        user_id = event.raw_data.get("user_id")  # 消息发送者
+        operator_id = event.raw_data.get("operator_id")  # 操作者
+        group_id = event.raw_data.get("group_id")
+
+        if not operator_id or not group_id:
+            return "已撤回"
+
+        # 获取 bot 自身 ID
+        try:
+            login_info = await self._bot_info.get_login_info()
+            bot_id = login_info.user_id
+        except Exception:
+            bot_id = 0
+
+        # 获取操作者昵称
+        try:
+            op_member = await self._bot_info.get_member_info(group_id, operator_id)
+            op_name = op_member.card or op_member.nickname or str(operator_id)
+        except Exception:
+            op_name = str(operator_id)
+
+        if operator_id == user_id:
+            # 自己撤回自己的消息
+            return f"{op_name}撤回了这条消息"
+        else:
+            # 管理员/群主撤回他人消息
+            if user_id == bot_id:
+                return f"管理员{op_name}撤回了你的这条消息"
+            else:
+                return f"管理员{op_name}撤回了这条消息"
 
     async def _handle_poke(self, event: PokeNoticeEvent) -> None:
         """处理戳一戳事件，群聊时写入 ChatLog，私聊时写入 PokeLog。

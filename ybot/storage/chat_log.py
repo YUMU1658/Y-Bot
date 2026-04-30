@@ -37,7 +37,7 @@ class ChatLogEntry:
     timestamp: float  # Unix 时间戳（来自 event.time）
     text: str  # 消息内容表示（含富媒体占位标记）
     is_bot: bool  # 是否为 bot 自身发送的消息
-    recalled: bool = False  # 是否已被撤回
+    recall_hint: str = ""  # 撤回提示文本（空字符串=未撤回）
     entry_type: str = "message"  # "message" | "poke"
 
 
@@ -118,7 +118,7 @@ class GroupChatLog:
         result = entries[start_idx:end_idx]
         return result[-limit:] if len(result) > limit else result
 
-    def mark_recalled(self, message_id: int) -> None:
+    def mark_recalled(self, message_id: int, hint: str = "已撤回") -> None:
         """将指定消息标记为已撤回。
 
         遍历所有群的缓冲区，找到对应 message_id 的条目并标记。
@@ -126,11 +126,12 @@ class GroupChatLog:
 
         Args:
             message_id: 被撤回消息的 message_id。
+            hint: 撤回提示文本（如"张三撤回了这条消息"）。
         """
         for entries in self._logs.values():
             for entry in entries:
                 if entry.message_id == message_id:
-                    entry.recalled = True
+                    entry.recall_hint = hint
                     return
 
     def is_recalled(self, message_id: int) -> bool:
@@ -145,8 +146,23 @@ class GroupChatLog:
         for entries in self._logs.values():
             for entry in entries:
                 if entry.message_id == message_id:
-                    return entry.recalled
+                    return bool(entry.recall_hint)
         return False
+
+    def get_recall_hint(self, message_id: int) -> str:
+        """获取指定消息的撤回提示文本。
+
+        Args:
+            message_id: 消息的 message_id。
+
+        Returns:
+            撤回提示文本，未撤回或未找到返回空字符串。
+        """
+        for entries in self._logs.values():
+            for entry in entries:
+                if entry.message_id == message_id:
+                    return entry.recall_hint
+        return ""
 
 
 @dataclass

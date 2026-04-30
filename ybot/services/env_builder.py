@@ -405,8 +405,8 @@ class MessageFormatter:
             header_parts.append(" \u2605友")
 
         # 撤回标记（放在方括号内部，防止群员通过发送文本伪造）
-        if entry.recalled:
-            header_parts.append(" | ⚠已撤回")
+        if entry.recall_hint:
+            header_parts.append(f" | ⚠{entry.recall_hint}")
 
         header = "[" + "".join(header_parts) + "]"
         return f"{header}\n{entry.text}"
