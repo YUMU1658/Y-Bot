@@ -15,7 +15,7 @@ from ybot.utils.logger import get_logger
 if TYPE_CHECKING:
     from ybot.models.event import GroupMessageEvent, PrivateMessageEvent
     from ybot.services.bot_info import BotInfoService
-    from ybot.storage.chat_log import ChatLogEntry, PokeLogEntry
+    from ybot.storage.chat_log import ChatLogEntry
 
 logger = get_logger("ENV")
 
@@ -417,10 +417,11 @@ class MessageFormatter:
     def build_context_message(
         entries: list[ChatLogEntry],
         new_message: str,
+        session_key: str = "",
     ) -> str:
         """将参考聊天记录和新触发消息组合为完整的 user 消息。
 
-        输出格式::
+        输出格式::\
 
             --- 以下是近期群聊记录（仅供参考） ---
             [#1001 14:30:15 张三(12345)]
@@ -437,6 +438,7 @@ class MessageFormatter:
         Args:
             entries: 参考聊天记录列表（按时间升序）。
             new_message: 已格式化的新触发消息文本。
+            session_key: 会话标识，用于动态选择标题。
 
         Returns:
             组合后的完整 user 消息文本。
@@ -444,51 +446,18 @@ class MessageFormatter:
         if not entries:
             return new_message
 
-        lines: list[str] = ["--- 以下是近期群聊记录（仅供参考） ---"]
+        # 根据 session_key 前缀动态选择标题
+        if session_key.startswith("group_"):
+            title = "近期群聊记录"
+        else:
+            title = "你近期发送的消息"
+
+        lines: list[str] = [f"--- 以下是{title}（仅供参考） ---"]
         for entry in entries:
             lines.append(MessageFormatter.format_chat_log_entry(entry))
-        lines.append("--- 以上是近期群聊记录 ---")
+        lines.append(f"--- 以上是{title} ---")
         lines.append("")  # 空行分隔
         lines.append(new_message)
 
         return "\n".join(lines)
 
-    @staticmethod
-    def build_poke_context_message(
-        poke_entries: list[PokeLogEntry],
-        new_message: str,
-    ) -> str:
-        """将戳一戳参考记录和新触发消息组合为完整的 user 消息。
-
-        输出格式::
-
-            --- 以下是近期互动记录（仅供参考） ---
-            [💢戳一戳 14:30:20] 张三(12345) 戳了戳 你
-            [💢戳一戳 14:30:30] 张三(12345) 抱了抱 你 并揉了揉
-            --- 以上是近期互动记录 ---
-
-            [#1004 14:31:00]
-            你好
-
-        如果没有戳一戳记录，则直接返回新消息。
-
-        Args:
-            poke_entries: 戳一戳记录列表（按时间升序）。
-            new_message: 已格式化的新触发消息文本。
-
-        Returns:
-            组合后的完整 user 消息文本。
-        """
-        if not poke_entries:
-            return new_message
-
-        lines: list[str] = ["--- 以下是近期互动记录（仅供参考） ---"]
-        for entry in poke_entries:
-            dt = datetime.fromtimestamp(entry.timestamp, tz=_CST)
-            time_str = dt.strftime("%H:%M:%S")
-            lines.append(f"[💢戳一戳 {time_str}] {entry.formatted_text}")
-        lines.append("--- 以上是近期互动记录 ---")
-        lines.append("")  # 空行分隔
-        lines.append(new_message)
-
-        return "\n".join(lines)

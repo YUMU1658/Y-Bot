@@ -49,7 +49,7 @@ from ybot.services.reply_parser import (
     parse_reply_actions,
 )
 from ybot.services.worldbook import WorldBookService
-from ybot.storage.chat_log import ChatLogEntry, GroupChatLog, PokeLog, PokeLogEntry
+from ybot.storage.chat_log import ChatLogEntry, SessionChatLog
 from ybot.storage.conversation import ConversationStore
 from ybot.tools import ToolRegistry
 from ybot.tools.recall_msg import RecallMsgTool
@@ -124,11 +124,8 @@ class Bot:
         self._env_builder = EnvBuilder(self._bot_info)
         self._msg_formatter = MessageFormatter(self._bot_info)
 
-        # 初始化群聊消息日志缓冲区
-        self._chat_log = GroupChatLog(buffer_size=config.ai.context_buffer)
-
-        # 初始化戳一戳记录缓冲区（私聊用）
-        self._poke_log = PokeLog(buffer_size=20)
+        # 初始化会话消息日志缓冲区（统一覆盖群聊、私聊、临时私聊）
+        self._chat_log = SessionChatLog(buffer_size=config.ai.context_buffer)
 
         # 初始化戳一戳速率限制器
         self._poke_limiter = PokeLimiter(
@@ -252,10 +249,22 @@ class Bot:
         根据事件类型进行日志输出和 AI 回复触发。
         """
         # 过滤 Bot 自身发送的消息，防止自回复死循环
-        # 但仍收集 bot 自身的群消息到上下文缓冲区
+        # 但仍收集 bot 自身的消息到上下文缓冲区（群聊和私聊）
+        # 注意：send_group_msg/send_private_msg 已主动写入 chat_log，
+        # 此处通过 has_message() 去重，避免 message_sent 事件重复收集
         if isinstance(event, MessageEvent) and event.user_id == event.self_id:
             if isinstance(event, GroupMessageEvent):
-                await self._collect_group_message(event, is_bot=True)
+                sk = f"group_{event.group_id}"
+                if not self._chat_log.has_message(sk, event.message_id):
+                    await self._collect_message(
+                        event, session_key=sk, is_bot=True
+                    )
+            elif isinstance(event, PrivateMessageEvent):
+                sk = self._resolve_bot_private_session_key(event)
+                if sk and not self._chat_log.has_message(sk, event.message_id):
+                    await self._collect_message(
+                        event, session_key=sk, is_bot=True
+                    )
             return
 
         # 首次收到事件时，延迟初始化 BotInfoService（需要 OneBot 客户端已连接）
@@ -272,7 +281,7 @@ class Bot:
             case GroupMessageEvent() as e:
                 self._log_group_message(e)
                 # 收集所有群消息到上下文缓冲区（包括非 @bot 的）
-                await self._collect_group_message(e, is_bot=False)
+                await self._collect_message(e, session_key=f"group_{e.group_id}", is_bot=False)
                 if self._is_at_me(e):
                     text = self._extract_content(e)
                     # 解析引用/回复消息的详情
@@ -290,7 +299,7 @@ class Bot:
                             context_msg,
                             last_ref_id,
                         ) = await self._build_context_user_message(
-                            e, formatted_msg, session_key
+                            session_key, e.message_id, formatted_msg
                         )
                         # 提取当前触发消息中的图片 URL
                         image_urls = self._extract_image_urls(e)
@@ -332,16 +341,17 @@ class Bot:
                         env_header = await self._env_builder.build_private_env(
                             e.user_id, e.sender.nickname
                         )
+                    # 收集私聊消息到上下文缓冲区
+                    await self._collect_message(e, session_key=session_key, is_bot=False)
                     # 格式化消息
                     formatted_msg = self._msg_formatter.format_private_message(e, text)
-                    # 拉取近期戳一戳记录作为参考上下文
-                    poke_entries = self._poke_log.drain(session_key)
-                    if poke_entries:
-                        context_msg = MessageFormatter.build_poke_context_message(
-                            poke_entries, formatted_msg
-                        )
-                    else:
-                        context_msg = formatted_msg
+                    # 构建带参考聊天记录的 user 消息
+                    (
+                        context_msg,
+                        last_ref_id,
+                    ) = await self._build_context_user_message(
+                        session_key, e.message_id, formatted_msg
+                    )
                     # 提取当前触发消息中的图片 URL
                     image_urls = self._extract_image_urls(e)
                     # 构建跨会话记忆的显示名称
@@ -363,6 +373,7 @@ class Bot:
                             "session_key": session_key,
                             "env_header": env_header,
                             "context_msg": context_msg,
+                            "last_ref_id": last_ref_id,
                             "image_urls": image_urls,
                             "user_id": e.user_id,
                             "display_name": display_name,
@@ -395,9 +406,9 @@ class Bot:
         self,
         reply: str,
         *,
-        send_func: Callable[[str, int | None], Awaitable[None]],
+        send_func: Callable[[str, int | None], Awaitable[int | None]],
         poke_func: Callable[[int], Awaitable[tuple[bool, str]]],
-        group_id: int | None = None,
+        session_key: str | None = None,
         interval: float = 1.0,
     ) -> str:
         """解析 AI 回复并按序发送消息/执行戳一戳。
@@ -412,7 +423,7 @@ class Bot:
             reply: AI 原始回复文本。
             send_func: 发送单条消息的异步函数（接受消息文本和可选的 reply_id）。
             poke_func: 执行戳一戳的异步函数（接受 target_id，返回 (成功, 文案/原因)）。
-            group_id: 群号（群聊时提供，用于写入 ChatLog）。
+            session_key: 会话标识（提供时用于写入 ChatLog）。
             interval: 动作之间的间隔（秒），默认 1.0。
 
         Returns:
@@ -437,10 +448,10 @@ class Bot:
                 original_tag = f'<poke target="{action.target_id}"/>'
                 if success:
                     replacement = f"[💢戳一戳] {text}"
-                    # 群聊：写入 ChatLog
-                    if group_id is not None:
+                    # 写入 ChatLog
+                    if session_key is not None:
                         await self._write_poke_chat_log(
-                            group_id=group_id, poke_text=text
+                            session_key=session_key, poke_text=text
                         )
                 else:
                     replacement = f"[戳一戳失败: {text}]"
@@ -458,18 +469,18 @@ class Bot:
         return transformed_reply
 
     async def _write_poke_chat_log(
-        self, *, group_id: int, poke_text: str
+        self, *, session_key: str, poke_text: str
     ) -> None:
-        """将 bot 主动发起的戳一戳写入群聊 ChatLog。
+        """将 bot 主动发起的戳一戳写入 ChatLog。
 
         Args:
-            group_id: 群号。
+            session_key: 会话标识。
             poke_text: 互动文案（如 "Bot名(QQ号) 戳了戳 目标QQ号"）。
         """
         login_info = await self._bot_info.get_login_info()
         entry = ChatLogEntry(
             message_id=_next_poke_id(),
-            group_id=group_id,
+            session_key=session_key,
             user_id=login_info.user_id,
             nickname=login_info.nickname or str(login_info.user_id),
             card="",
@@ -516,40 +527,32 @@ class Bot:
         # 构建发送函数和 poke 函数
         if msg_type == "group":
             group_id = data["group_id"]
-            send_func = lambda msg, rid=None, gid=group_id: self.send_group_msg(
-                gid, msg, rid
+            send_func = lambda msg, rid=None, gid=group_id, sk=session_key: self.send_group_msg(
+                gid, msg, rid, session_key=sk
             )
             poke_func = lambda tid, gid=group_id: self.send_poke(tid, gid)
         else:
             user_id = data["user_id"]
-            send_func = lambda msg, rid=None, uid=user_id: self.send_private_msg(
-                uid, msg, rid
+            send_func = lambda msg, rid=None, uid=user_id, sk=session_key: self.send_private_msg(
+                uid, msg, rid, session_key=sk
             )
             poke_func = lambda tid: self.send_poke(tid, None)
 
         if len(request.messages) == 1:
-            if msg_type == "group":
-                user_message = data["context_msg"]
-                last_ref_id = data["last_ref_id"]
-            else:
-                # 私聊：使用 context_msg（包含戳一戳上下文），回退到 formatted_msg
-                user_message = data.get("context_msg", last_msg.formatted_msg)
-                last_ref_id = None
+            # ---- 单条消息：直接使用已预处理的数据 ----
+            user_message = data["context_msg"]
+            last_ref_id = data.get("last_ref_id")
         else:
-            if msg_type == "group":
-                first_data = request.messages[0].context_data
-                parts = [first_data["context_msg"]]
-                for m in request.messages[1:]:
-                    parts.append(m.formatted_msg)
-                user_message = "\n".join(parts)
-                last_ref_id = data["last_ref_id"]
-            else:
-                # 私聊：第一条使用 context_msg（含戳一戳上下文），后续用 formatted_msg
-                first_data = request.messages[0].context_data
-                parts = [first_data.get("context_msg", request.messages[0].formatted_msg)]
-                parts.extend(m.formatted_msg for m in request.messages[1:])
-                user_message = "\n".join(parts)
-                last_ref_id = None
+            # ---- 多条消息合并 ----
+            # 第一条消息的 context_msg 包含完整的聊天记录引用 + 第一条格式化消息
+            # 后续消息只需追加其 formatted_msg
+            first_data = request.messages[0].context_data
+            parts = [first_data["context_msg"]]
+            for m in request.messages[1:]:
+                parts.append(m.formatted_msg)
+            user_message = "\n".join(parts)
+            # last_ref_id 使用最后一条消息的值
+            last_ref_id = data.get("last_ref_id")
 
         # 注入打断提示（如果有）
         interrupt_hint = request.messages[0].context_data.get("interrupt_hint")
@@ -567,7 +570,7 @@ class Bot:
         sent_messages: list[str] = []  # 追踪已发送的消息
         # 收集戳一戳替换结果：(原始标签文本, 替换文本)
         poke_replacements: list[tuple[str, str]] = []
-        stream_group_id = data.get("group_id") if msg_type == "group" else None
+        stream_session_key = data["session_key"]
 
         async def on_action(action: ParsedAction) -> None:
             """流式回调：将完整动作放入队列。"""
@@ -602,10 +605,9 @@ class Bot:
                     original_tag = f'<poke target="{action.target_id}"/>'
                     if success:
                         replacement = f"[💢戳一戳] {text}"
-                        if stream_group_id is not None:
-                            await self._write_poke_chat_log(
-                                group_id=stream_group_id, poke_text=text
-                            )
+                        await self._write_poke_chat_log(
+                            session_key=stream_session_key, poke_text=text
+                        )
                     else:
                         replacement = f"[戳一戳失败: {text}]"
                     poke_replacements.append((original_tag, replacement))
@@ -692,45 +694,32 @@ class Bot:
         # 构建发送函数和 poke 函数
         if msg_type == "group":
             group_id = data["group_id"]
-            send_func = lambda msg, rid=None, gid=group_id: self.send_group_msg(
-                gid, msg, rid
+            send_func = lambda msg, rid=None, gid=group_id, sk=session_key: self.send_group_msg(
+                gid, msg, rid, session_key=sk
             )
             poke_func = lambda tid, gid=group_id: self.send_poke(tid, gid)
         else:
             user_id = data["user_id"]
-            send_func = lambda msg, rid=None, uid=user_id: self.send_private_msg(
-                uid, msg, rid
+            send_func = lambda msg, rid=None, uid=user_id, sk=session_key: self.send_private_msg(
+                uid, msg, rid, session_key=sk
             )
             poke_func = lambda tid: self.send_poke(tid, None)
 
         if len(request.messages) == 1:
             # ---- 单条消息：直接使用已预处理的数据 ----
-            if msg_type == "group":
-                user_message = data["context_msg"]
-                last_ref_id = data["last_ref_id"]
-            else:
-                # 私聊：使用 context_msg（包含戳一戳上下文），回退到 formatted_msg
-                user_message = data.get("context_msg", last_msg.formatted_msg)
-                last_ref_id = None
+            user_message = data["context_msg"]
+            last_ref_id = data.get("last_ref_id")
         else:
             # ---- 多条消息合并 ----
-            if msg_type == "group":
-                # 第一条消息的 context_msg 包含完整的聊天记录引用 + 第一条格式化消息
-                # 后续消息只需追加其 formatted_msg
-                first_data = request.messages[0].context_data
-                parts = [first_data["context_msg"]]
-                for m in request.messages[1:]:
-                    parts.append(m.formatted_msg)
-                user_message = "\n".join(parts)
-                # last_ref_id 使用最后一条消息的值
-                last_ref_id = data["last_ref_id"]
-            else:
-                # 私聊：第一条使用 context_msg（含戳一戳上下文），后续用 formatted_msg
-                first_data = request.messages[0].context_data
-                parts = [first_data.get("context_msg", request.messages[0].formatted_msg)]
-                parts.extend(m.formatted_msg for m in request.messages[1:])
-                user_message = "\n".join(parts)
-                last_ref_id = None
+            # 第一条消息的 context_msg 包含完整的聊天记录引用 + 第一条格式化消息
+            # 后续消息只需追加其 formatted_msg
+            first_data = request.messages[0].context_data
+            parts = [first_data["context_msg"]]
+            for m in request.messages[1:]:
+                parts.append(m.formatted_msg)
+            user_message = "\n".join(parts)
+            # last_ref_id 使用最后一条消息的值
+            last_ref_id = data.get("last_ref_id")
 
         # 注入打断提示（如果有）
         interrupt_hint = request.messages[0].context_data.get("interrupt_hint")
@@ -769,12 +758,11 @@ class Bot:
                 await self._reprocess_after_interrupt(request, session_key)
                 return
 
-        poke_group_id = data.get("group_id") if msg_type == "group" else None
         transformed_reply = await self._send_reply(
             reply,
             send_func=send_func,
             poke_func=poke_func,
-            group_id=poke_group_id,
+            session_key=session_key,
         )
 
         # 如果有 poke 标签被替换，更新数据库中的 AI 回复
@@ -889,9 +877,14 @@ class Bot:
     # ---- 消息发送 ----
 
     async def send_group_msg(
-        self, group_id: int, message: str, reply_id: int | None = None
-    ) -> None:
-        """发送群聊消息。
+        self,
+        group_id: int,
+        message: str,
+        reply_id: int | None = None,
+        *,
+        session_key: str | None = None,
+    ) -> int | None:
+        """发送群聊消息并主动收集到 chat_log。
 
         将文本中的 <at qq="..."/> 标签解析为 OneBot at 消息段，
         以消息段数组格式发送。当 reply_id 不为 None 时，在消息段
@@ -901,22 +894,57 @@ class Bot:
             group_id: 目标群号。
             message: 消息文本（可能包含 <at> 标签）。
             reply_id: 要引用的消息 ID（可选）。
+            session_key: 会话标识（用于 chat_log 写入）。
+                如果不提供，默认为 group_{group_id}。
+
+        Returns:
+            发送成功时返回 message_id，失败时返回 None。
         """
         segments = text_to_segments(message)
         if reply_id is not None:
             segments.insert(0, {"type": "reply", "data": {"id": str(reply_id)}})
-        await self._ws_server.send_api(
-            "send_group_msg",
-            {
-                "group_id": group_id,
-                "message": segments,
-            },
-        )
+
+        try:
+            result = await self._ws_server.call_api(
+                "send_group_msg",
+                {"group_id": group_id, "message": segments},
+            )
+            msg_id = result.get("message_id") if isinstance(result, dict) else None
+        except Exception as e:
+            self._logger.error(f"发送群聊消息失败: {e}")
+            return None
+
+        # 主动写入 chat_log
+        if msg_id is not None:
+            sk = session_key or f"group_{group_id}"
+            login_info = await self._bot_info.get_login_info()
+            entry = ChatLogEntry(
+                message_id=msg_id,
+                session_key=sk,
+                user_id=login_info.user_id,
+                nickname=login_info.nickname or str(login_info.user_id),
+                card="",
+                role="",
+                level="",
+                title="",
+                is_friend=False,
+                timestamp=time.time(),
+                text=message,
+                is_bot=True,
+            )
+            self._chat_log.add(entry)
+
+        return msg_id
 
     async def send_private_msg(
-        self, user_id: int, message: str, reply_id: int | None = None
-    ) -> None:
-        """发送私聊消息。
+        self,
+        user_id: int,
+        message: str,
+        reply_id: int | None = None,
+        *,
+        session_key: str | None = None,
+    ) -> int | None:
+        """发送私聊消息并主动收集到 chat_log。
 
         将文本中的 <at qq="..."/> 标签解析为 OneBot at 消息段，
         以消息段数组格式发送。当 reply_id 不为 None 时，在消息段
@@ -926,17 +954,47 @@ class Bot:
             user_id: 目标用户 QQ 号。
             message: 消息文本（可能包含 <at> 标签）。
             reply_id: 要引用的消息 ID（可选）。
+            session_key: 会话标识（用于 chat_log 写入）。
+                如果不提供，默认为 friend_{user_id}。
+
+        Returns:
+            发送成功时返回 message_id，失败时返回 None。
         """
         segments = text_to_segments(message)
         if reply_id is not None:
             segments.insert(0, {"type": "reply", "data": {"id": str(reply_id)}})
-        await self._ws_server.send_api(
-            "send_private_msg",
-            {
-                "user_id": user_id,
-                "message": segments,
-            },
-        )
+
+        try:
+            result = await self._ws_server.call_api(
+                "send_private_msg",
+                {"user_id": user_id, "message": segments},
+            )
+            msg_id = result.get("message_id") if isinstance(result, dict) else None
+        except Exception as e:
+            self._logger.error(f"发送私聊消息失败: {e}")
+            return None
+
+        # 主动写入 chat_log
+        if msg_id is not None:
+            sk = session_key or f"friend_{user_id}"
+            login_info = await self._bot_info.get_login_info()
+            entry = ChatLogEntry(
+                message_id=msg_id,
+                session_key=sk,
+                user_id=login_info.user_id,
+                nickname=login_info.nickname or str(login_info.user_id),
+                card="",
+                role="",
+                level="",
+                title="",
+                is_friend=False,
+                timestamp=time.time(),
+                text=message,
+                is_bot=True,
+            )
+            self._chat_log.add(entry)
+
+        return msg_id
 
     async def send_poke(
         self, target_id: int, group_id: int | None = None
@@ -1000,13 +1058,13 @@ class Bot:
 
     # ---- 辅助方法 ----
 
-    async def _collect_group_message(
-        self, event: GroupMessageEvent, *, is_bot: bool
+    async def _collect_message(
+        self, event: MessageEvent, *, session_key: str, is_bot: bool
     ) -> None:
-        """收集群消息到上下文缓冲区。
+        """收集消息到会话上下文缓冲区。
 
-        对所有群消息（包括非 @bot 的和 bot 自身的）调用，
-        将消息元信息和内容表示存入 GroupChatLog。
+        对所有消息（包括非触发的和 bot 自身的）调用，
+        将消息元信息和内容表示存入 SessionChatLog。
 
         内容表示包含所有消息段的信息（文本、图片占位标记、
         表情标记等），不再仅限于纯文本。
@@ -1015,7 +1073,8 @@ class Bot:
         使用 event.sender 中的数据，避免为每条消息调用 API。
 
         Args:
-            event: 群聊消息事件。
+            event: 消息事件（群聊或私聊）。
+            session_key: 会话标识。
             is_bot: 是否为 bot 自身发送的消息。
         """
         text = self._extract_content(event)
@@ -1025,13 +1084,23 @@ class Bot:
         # 解析引用/回复消息的详情
         text = await self._resolve_reply(text, event)
 
+        # 群聊消息从 event.sender 获取群相关元数据
+        if isinstance(event, GroupMessageEvent):
+            nickname = event.sender.nickname or str(event.user_id)
+            card = event.sender.card or ""
+            role = event.sender.role or ""
+        else:
+            nickname = event.sender.nickname or str(event.user_id)
+            card = ""
+            role = ""
+
         entry = ChatLogEntry(
             message_id=event.message_id,
-            group_id=event.group_id,
+            session_key=session_key,
             user_id=event.user_id,
-            nickname=event.sender.nickname or str(event.user_id),
-            card=event.sender.card or "",
-            role=event.sender.role or "",
+            nickname=nickname,
+            card=card,
+            role=role,
             level="",  # event.sender 不含 level，避免 API 调用
             title="",  # event.sender 不含 title，避免 API 调用
             is_friend=False,  # 避免 API 调用，非触发消息不需要精确值
@@ -1041,21 +1110,47 @@ class Bot:
         )
         self._chat_log.add(entry)
 
+    def _resolve_bot_private_session_key(
+        self, event: PrivateMessageEvent
+    ) -> str | None:
+        """从 BOT 自身的私聊 message_sent 事件中推断 session_key。
+
+        BOT 自己发送的私聊消息通过 message_sent 事件回报，
+        此时 event.user_id = BOT 自身 QQ，需要从 event.raw_data
+        中提取接收方 QQ 来构建 session_key。
+
+        Returns:
+            会话标识字符串，无法确定接收方时返回 None。
+        """
+        # NapCat/go-cqhttp 在 message_sent 事件中提供 target_id
+        target_id = event.raw_data.get("target_id")
+        if not target_id:
+            # 降级：尝试 peer_id（部分实现使用此字段）
+            target_id = event.raw_data.get("peer_id")
+        if not target_id:
+            return None  # 无法确定接收方，跳过收集
+
+        if event.sub_type == "group":
+            source_group_id = event.raw_data.get("sender", {}).get("group_id", 0)
+            return f"temp_{source_group_id}_{target_id}"
+        else:
+            return f"friend_{target_id}"
+
     async def _build_context_user_message(
         self,
-        event: GroupMessageEvent,
-        formatted_msg: str,
         session_key: str,
+        current_msg_id: int,
+        formatted_msg: str,
     ) -> tuple[str, int | None]:
         """构建带参考聊天记录的 user 消息。
 
-        从 GroupChatLog 获取参考聊天记录（去重已提供过的），
+        从 SessionChatLog 获取参考聊天记录（去重已提供过的），
         与当前触发消息组合为完整的 user 消息。
 
         Args:
-            event: 当前触发的群聊消息事件。
-            formatted_msg: 已格式化的当前触发消息文本。
             session_key: 会话标识。
+            current_msg_id: 当前触发消息的 message_id。
+            formatted_msg: 已格式化的当前触发消息文本。
 
         Returns:
             (完整的 user 消息文本, 本轮参考记录中最新一条的 message_id)。
@@ -1067,19 +1162,26 @@ class Bot:
 
         # 获取参考聊天记录（排除当前触发消息本身）
         ref_entries = self._chat_log.get_between(
-            group_id=event.group_id,
+            session_key=session_key,
             after_msg_id=prev_last_ref_id,
-            before_msg_id=event.message_id,
+            before_msg_id=current_msg_id,
             limit=context_limit,
         )
 
-        # 记录本轮参考记录中最新一条的 message_id
-        last_ref_id: int | None = None
-        if ref_entries:
-            last_ref_id = ref_entries[-1].message_id
+        # 私聊：只保留 BOT 自己的消息作为参考
+        # 对方的消息已在对话历史中，无需重复提供
+        if not session_key.startswith("group_"):
+            ref_entries = [e for e in ref_entries if e.is_bot]
+
+        # 始终使用当前触发消息 ID 作为去重边界
+        # 下一轮 get_between(after_msg_id=current_msg_id, ...) 会从触发消息之后开始取，
+        # 自动排除：所有已提供过的参考记录 + 触发消息本身
+        last_ref_id = current_msg_id
 
         # 组合参考记录 + 新消息
-        context_msg = MessageFormatter.build_context_message(ref_entries, formatted_msg)
+        context_msg = MessageFormatter.build_context_message(
+            ref_entries, formatted_msg, session_key=session_key
+        )
         return context_msg, last_ref_id
 
     @staticmethod
@@ -1316,7 +1418,7 @@ class Bot:
         self._notice_logger.info(f"{event.notice_type}{extra_info}")
 
     async def _handle_recall(self, event: NoticeEvent) -> None:
-        """处理撤回通知，标记 GroupChatLog 中对应消息为已撤回。"""
+        """处理撤回通知，标记 SessionChatLog 中对应消息为已撤回。"""
         if event.notice_type not in ("group_recall", "friend_recall"):
             return
 
@@ -1373,14 +1475,13 @@ class Bot:
                 return f"管理员{op_name}撤回了这条消息"
 
     async def _handle_poke(self, event: PokeNoticeEvent) -> None:
-        """处理戳一戳事件，群聊时写入 ChatLog，私聊时写入 PokeLog。
+        """处理戳一戳事件，统一写入 SessionChatLog。
 
         1. 通过 BotInfoService 获取戳者和被戳者的昵称
         2. 若被戳者是 bot 自身，使用"你(QQ号)"代替昵称（LLM 视角，附带 QQ 号防伪造）
         3. 构建互动文案文本
-        4. 群聊：创建 ChatLogEntry（entry_type="poke"），写入 GroupChatLog
-        5. 私聊：创建 PokeLogEntry，写入 PokeLog
-        6. 不提交到请求队列，不触发 AI 回复
+        4. 创建 ChatLogEntry（entry_type="poke"），写入 SessionChatLog
+        5. 不提交到请求队列，不触发 AI 回复
 
         Args:
             event: 戳一戳通知事件。
@@ -1413,32 +1514,33 @@ class Bot:
         poke_text = event.poke_text or "戳了戳"
         text = f"{poker_name}({event.user_id}) {poke_text} {target_display}"
 
-        # 群聊：写入 GroupChatLog
+        # 确定 session_key
         if group_id:
-            entry = ChatLogEntry(
-                message_id=_next_poke_id(),
-                group_id=group_id,
-                user_id=event.user_id,
-                nickname=poker_member.nickname or str(event.user_id),
-                card=poker_member.card or "",
-                role="",
-                level="",
-                title="",
-                is_friend=False,
-                timestamp=event.time,
-                text=text,
-                is_bot=is_bot,
-                entry_type="poke",
-            )
-            self._chat_log.add(entry)
+            session_key = f"group_{group_id}"
+            nickname = poker_member.nickname or str(event.user_id)
+            card = poker_member.card or ""
         else:
-            # 私聊：写入 PokeLog
             session_key = f"friend_{event.user_id}"
-            poke_entry = PokeLogEntry(
-                timestamp=event.time,
-                formatted_text=text,
-            )
-            self._poke_log.add(session_key, poke_entry)
+            nickname = poker_name
+            card = ""
+
+        # 统一写入 SessionChatLog
+        entry = ChatLogEntry(
+            message_id=_next_poke_id(),
+            session_key=session_key,
+            user_id=event.user_id,
+            nickname=nickname,
+            card=card,
+            role="",
+            level="",
+            title="",
+            is_friend=False,
+            timestamp=event.time,
+            text=text,
+            is_bot=is_bot,
+            entry_type="poke",
+        )
+        self._chat_log.add(entry)
 
     def _log_request_event(self, event: RequestEvent) -> None:
         """记录请求事件日志。"""

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ybot.core.ws_server import WebSocketServer
     from ybot.services.bot_info import BotInfoService
-    from ybot.storage.chat_log import GroupChatLog
+    from ybot.storage.chat_log import SessionChatLog
 
 
 @dataclass
@@ -29,7 +29,7 @@ class ToolContext:
     session_key: str
     ws_server: WebSocketServer
     bot_info: BotInfoService
-    chat_log: GroupChatLog
+    chat_log: SessionChatLog
 
 
 @dataclass

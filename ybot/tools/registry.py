@@ -21,7 +21,7 @@ class ToolRegistry:
         _tools: 已注册的工具映射（name → BaseTool）。
         _ws_server: WebSocket 服务端引用。
         _bot_info: Bot 信息缓存服务引用。
-        _chat_log: 群聊消息日志引用。
+        _chat_log: 会话消息日志引用。
     """
 
     def __init__(
