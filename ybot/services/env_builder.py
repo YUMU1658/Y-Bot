@@ -125,7 +125,7 @@ class EnvBuilder:
             [ENV]
             Group: {群名}(ID:{group_id}) | {群人数}人
             Time: {YYYY-MM-DD HH:MM} (UTC+8)
-            Self: @{Bot昵称} → {Bot群昵称} | {等级/头衔/身份}
+            Self: @{Bot昵称}({QQ号}) → {Bot群昵称} | {等级/头衔/身份}
 
         Args:
             group_id: 群号。
@@ -160,6 +160,7 @@ class EnvBuilder:
         # 构建 Self 行
         self_line = self._build_self_line(
             bot_nickname=bot_nickname,
+            bot_qq=login_info.user_id,
             bot_card=bot_member.card,
             level=bot_member.level,
             title=bot_member.title,
@@ -176,7 +177,7 @@ class EnvBuilder:
             [ENV]
             Friend: {对方昵称}(ID:friend_{user_id})
             Time: {YYYY-MM-DD HH:MM} (UTC+8)
-            Self: @{Bot昵称}
+            Self: @{Bot昵称}({QQ号})
 
         Args:
             user_id: 对方用户 QQ 号。
@@ -193,7 +194,7 @@ class EnvBuilder:
         now = datetime.now(_CST)
         time_line = f"Time: {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)"
 
-        return f"[ENV]\nFriend: {display_name}(ID:friend_{user_id})\n{time_line}\nSelf: @{bot_nickname}"
+        return f"[ENV]\nFriend: {display_name}(ID:friend_{user_id})\n{time_line}\nSelf: @{bot_nickname}({login_info.user_id})"
 
     async def build_temp_env(
         self, user_id: int, source_group_id: int, nickname: str
@@ -205,7 +206,7 @@ class EnvBuilder:
             [ENV]
             Temp: {对方昵称}(ID:temp_{source_group_id}_{user_id}) ← {来源群名}(ID:{source_group_id})
             Time: {YYYY-MM-DD HH:MM} (UTC+8)
-            Self: @{Bot昵称}
+            Self: @{Bot昵称}({QQ号})
 
         Args:
             user_id: 对方用户 QQ 号。
@@ -238,12 +239,13 @@ class EnvBuilder:
                 f" \u2190 (ID:{source_group_id})"
             )
 
-        return f"[ENV]\n{temp_line}\n{time_line}\nSelf: @{bot_nickname}"
+        return f"[ENV]\n{temp_line}\n{time_line}\nSelf: @{bot_nickname}({login_info.user_id})"
 
     @staticmethod
     def _build_self_line(
         *,
         bot_nickname: str,
+        bot_qq: int,
         bot_card: str,
         level: str,
         title: str,
@@ -251,10 +253,10 @@ class EnvBuilder:
     ) -> str:
         """构建 Self 行。
 
-        完整格式: ``Self: @{Bot昵称} → {Bot群昵称} | {等级/头衔/身份}``
+        完整格式: ``Self: @{Bot昵称}({QQ号}) → {Bot群昵称} | {等级/头衔/身份}``
         缺省规则：缺什么省什么，连同分隔符。
         """
-        parts = [f"Self: @{bot_nickname}"]
+        parts = [f"Self: @{bot_nickname}({bot_qq})"]
 
         # 群昵称（名片）
         if bot_card and bot_card != bot_nickname:
