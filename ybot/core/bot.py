@@ -52,6 +52,7 @@ from ybot.services.worldbook import WorldBookService
 from ybot.storage.chat_log import ChatLogEntry, SessionChatLog
 from ybot.storage.conversation import ConversationStore
 from ybot.tools import ToolRegistry
+from ybot.tools.group_info import GroupInfoTool
 from ybot.tools.recall_msg import RecallMsgTool
 from ybot.utils.logger import get_logger, setup_logger
 
@@ -142,6 +143,7 @@ class Bot:
                 chat_log=self._chat_log,
             )
             self._tool_registry.register(RecallMsgTool())
+            self._tool_registry.register(GroupInfoTool())
 
         # 初始化 AI 对话服务（注入工具注册中心）
         self._ai_chat = AIChatService(
