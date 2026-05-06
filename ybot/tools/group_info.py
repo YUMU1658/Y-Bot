@@ -610,8 +610,8 @@ class GroupInfoTool(BaseTool):
         """
         try:
             data = await context.ws_server.call_api(
-                "get_group_info",
-                {"group_id": group_id, "no_cache": True},
+                "get_group_detail_info",
+                {"group_id": group_id},
                 timeout=5.0,
             )
         except Exception as e:
@@ -627,7 +627,7 @@ class GroupInfoTool(BaseTool):
                 message="获取群信息失败: API 返回数据为空",
             )
 
-        group_name = data.get("group_name", "")
+        group_name = data.get("group_name") or data.get("groupName", "")
         lines: list[str] = [
             f"群资料 — {group_name}(ID:{group_id})：",
         ]
@@ -635,23 +635,25 @@ class GroupInfoTool(BaseTool):
         lines.append(f"· 群名：{group_name}")
         lines.append(f"· 群号：{group_id}")
 
-        member_count = data.get("member_count")
+        member_count = data.get("member_count") or data.get("memberNum")
         if member_count is not None:
             lines.append(f"· 当前成员数：{member_count}")
 
-        max_member = data.get("max_member_count")
+        max_member = data.get("max_member_count") or data.get("maxMemberNum")
         if max_member is not None:
             lines.append(f"· 最大成员数：{max_member}")
 
-        memo = data.get("group_memo")
-        if memo:
-            lines.append(f"· 群介绍：{memo}")
+        # fingerMemo 才是群资料卡上的「群介绍」
+        # groupMemo 是「群公告」，不在此处显示
+        intro = data.get("fingerMemo") or data.get("finger_memo")
+        if intro:
+            lines.append(f"· 群介绍：{intro}")
 
-        create_time = data.get("group_create_time")
+        create_time = data.get("groupCreateTime") or data.get("group_create_time")
         if create_time:
             lines.append(f"· 创建时间：{_format_timestamp(create_time)}")
 
-        group_level = data.get("group_level")
+        group_level = data.get("group_level") or data.get("groupGrade")
         if group_level:
             lines.append(f"· 群等级：{group_level}")
 
