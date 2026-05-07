@@ -177,9 +177,11 @@ class ConversationStore:
     ) -> list[dict[str, Any]]:
         """获取指定会话的最近 N 条消息。
 
-        对于 ``content_type="multimodal"`` 的消息，会将 content 从 JSON 字符串
-        解析为列表，并将其中的 ``image_url`` 元素替换为文本占位符 ``[图片(历史)]``，
-        避免回放过期 URL 和浪费 token。
+        对于 ``content_type="multimodal"`` 的消息：
+        - base64 图片（``data:image/...``）保留在历史中，随 ``max_history`` 自然截断
+        - GIF 帧（带 ``_gif_frame`` 标记）仅保留首帧（``_gif_frame == 0``），
+          非首帧被跳过以节省 token
+        - 外部 URL（旧数据或降级情况）替换为 ``[图片(历史)]`` 占位符
 
         对于 ``content_type="tool_calls"`` 的消息，还原为包含 ``tool_calls`` 键的
         assistant 消息。对于 ``content_type="tool_result"`` 的消息，还原为 ``role="tool"``
@@ -191,7 +193,7 @@ class ConversationStore:
 
         Returns:
             按时间升序排列的消息列表，每条为
-            ``{"role": "user"|"assistant"|"tool", "content": "..." | [...]}``。
+            ``{"role": "user"|"assistant"|"tool", "content": "..." | [...]}``.
         """
         assert self._db is not None, "ConversationStore 未初始化"
 
@@ -236,11 +238,24 @@ class ConversationStore:
             elif content_type == "multimodal":
                 try:
                     content_list = json.loads(content)
-                    # 将 image_url 元素替换为文本占位符
+                    # 处理 image_url 元素：保留 base64、GIF 仅首帧、外部 URL 替换
                     sanitized: list[dict[str, Any]] = []
                     for item in content_list:
                         if isinstance(item, dict) and item.get("type") == "image_url":
-                            sanitized.append({"type": "text", "text": "[图片(历史)]"})
+                            # GIF 非首帧：跳过
+                            gif_frame = item.get("_gif_frame")
+                            if gif_frame is not None and gif_frame > 0:
+                                continue
+
+                            url = item.get("image_url", {}).get("url", "")
+                            if url.startswith("data:image/"):
+                                # base64 图片（含 GIF 首帧）：保留
+                                sanitized.append(item)
+                            else:
+                                # 外部 URL（旧数据或降级情况）：替换为占位符
+                                sanitized.append(
+                                    {"type": "text", "text": "[图片(历史)]"}
+                                )
                         else:
                             sanitized.append(item)
                     result.append({"role": role, "content": sanitized})

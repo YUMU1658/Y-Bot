@@ -1,7 +1,8 @@
 """图片处理工具模块。
 
-提供 GIF 检测、下载与抽帧功能，用于将 GIF 动图转换为
-多帧静态图片以供 Vision 模型分析。
+提供图片下载、base64 转换、GIF 检测与抽帧功能。
+所有图片在存储时统一转为 base64，避免 QQ CDN URL 过期问题。
+GIF 动图会被抽帧为多张静态图片，并附带 ``_gif_frame`` 序号标记。
 """
 
 from __future__ import annotations
@@ -19,6 +20,14 @@ logger = get_logger("ImageUtils")
 # GIF 文件魔数
 _GIF_MAGIC = (b"GIF87a", b"GIF89a")
 
+# 常见图片格式魔数 → MIME 子类型映射
+_IMAGE_MAGIC: list[tuple[bytes, str]] = [
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"RIFF", "webp"),  # WebP 以 RIFF 开头（后续还有 WEBP 标记）
+    (b"BM", "bmp"),
+]
+
 # 下载大小上限（10 MB）
 _MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024
 
@@ -30,9 +39,12 @@ async def process_image_url(
 ) -> list[dict]:
     """处理单个图片 URL，返回 OpenAI Vision 格式的 content items。
 
-    - 非 GIF 图片：返回 ``[{"type": "image_url", "image_url": {"url": url}}]``
-    - GIF 动图：下载 → 抽帧 → 返回多个 base64 PNG ``image_url`` items
-    - 失败时返回空列表（优雅降级）
+    所有图片都会下载并转为 base64 存储，避免 QQ CDN URL 过期问题。
+
+    - 非 GIF 图片：下载 → base64 → 返回单个 ``image_url`` item
+    - GIF 动图：下载 → 抽帧 → 返回多个 base64 PNG ``image_url`` items，
+      每个 item 附带 ``_gif_frame`` 序号标记
+    - 失败时优雅降级（返回原始 URL 或空列表）
 
     Args:
         session: aiohttp 异步 HTTP 会话。
@@ -49,7 +61,14 @@ async def process_image_url(
         is_gif = False
 
     if not is_gif:
-        return [{"type": "image_url", "image_url": {"url": url}}]
+        # 非 GIF：下载并转 base64
+        try:
+            data = await _download(session, url)
+            b64_url = _image_to_base64(data)
+            return [{"type": "image_url", "image_url": {"url": b64_url}}]
+        except Exception:
+            logger.warning(f"图片下载/转换失败，使用原始 URL: {url}")
+            return [{"type": "image_url", "image_url": {"url": url}}]
 
     # GIF 处理：下载 → 抽帧
     try:
@@ -69,8 +88,12 @@ async def process_image_url(
         return [{"type": "image_url", "image_url": {"url": url}}]
 
     return [
-        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-        for b64 in frames
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"},
+            "_gif_frame": idx,
+        }
+        for idx, b64 in enumerate(frames)
     ]
 
 
@@ -145,7 +168,7 @@ async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
         content_length = resp.headers.get("Content-Length")
         if content_length and int(content_length) > _MAX_DOWNLOAD_SIZE:
             raise ValueError(
-                f"GIF 文件过大: {int(content_length)} bytes > {_MAX_DOWNLOAD_SIZE} bytes"
+                f"图片文件过大: {int(content_length)} bytes > {_MAX_DOWNLOAD_SIZE} bytes"
             )
 
         # 流式读取，带大小限制
@@ -155,7 +178,7 @@ async def _download(session: aiohttp.ClientSession, url: str) -> bytes:
             total += len(chunk)
             if total > _MAX_DOWNLOAD_SIZE:
                 raise ValueError(
-                    f"GIF 下载超过大小限制: > {_MAX_DOWNLOAD_SIZE} bytes"
+                    f"图片下载超过大小限制: > {_MAX_DOWNLOAD_SIZE} bytes"
                 )
             chunks.append(chunk)
 
@@ -223,3 +246,40 @@ def _frame_to_base64(frame: Image.Image) -> str:
         frame.convert("RGB").save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("ascii")
+
+
+def _detect_image_mime(data: bytes) -> str:
+    """通过魔数检测图片的 MIME 子类型。
+
+    Args:
+        data: 图片二进制数据。
+
+    Returns:
+        MIME 子类型字符串（如 ``"png"``、``"jpeg"``），
+        检测失败时默认返回 ``"png"``。
+    """
+    for magic, mime in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            # WebP 需要额外检查 RIFF 头后的 WEBP 标记
+            if mime == "webp":
+                if len(data) >= 12 and data[8:12] == b"WEBP":
+                    return "webp"
+                continue
+            return mime
+    return "png"  # 默认 PNG
+
+
+def _image_to_base64(data: bytes) -> str:
+    """将图片二进制数据转为 ``data:image/{format};base64,...`` 格式字符串。
+
+    尽量保留原始格式（JPEG 不会被重编码为 PNG），以避免体积膨胀。
+
+    Args:
+        data: 图片二进制数据。
+
+    Returns:
+        ``data:image/{mime};base64,...`` 格式的完整 data URL。
+    """
+    mime = _detect_image_mime(data)
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:image/{mime};base64,{b64}"
