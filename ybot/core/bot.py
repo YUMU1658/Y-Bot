@@ -1228,8 +1228,9 @@ class Bot:
     def _extract_image_urls(event: MessageEvent) -> list[str]:
         """从消息段中提取图片 URL 列表。
 
-        遍历消息段，找到 ``type="image"`` 且 ``sub_type != 1``（排除自定义表情）
-        的段，提取其 ``url`` 字段。
+        遍历消息段，找到 ``type="image"`` 的段，提取其 ``url`` 字段。
+        包括普通图片和自定义表情（``sub_type=1``），以便 Vision 模型
+        也能分析自定义表情和 GIF 动图。
 
         Args:
             event: 消息事件。
@@ -1240,10 +1241,6 @@ class Bot:
         urls: list[str] = []
         for seg in event.message:
             if seg.type != "image":
-                continue
-            # sub_type=1 表示自定义表情（小表情 GIF），不适合 vision 分析
-            sub_type = seg.data.get("sub_type")
-            if sub_type is not None and str(sub_type) == "1":
                 continue
             url = seg.data.get("url")
             if url:

@@ -22,6 +22,7 @@ from ybot.services.reply_parser import ParsedAction
 from ybot.services.stream_parser import StreamActionParser
 from ybot.services.worldbook import WorldBookService
 from ybot.storage.conversation import ConversationStore
+from ybot.utils.image_utils import process_image_url
 from ybot.utils.logger import get_logger
 
 logger = get_logger("AI")
@@ -137,7 +138,8 @@ class AIChatService:
                 {"type": "text", "text": user_message}
             ]
             for url in image_urls:
-                content_array.append({"type": "image_url", "image_url": {"url": url}})
+                items = await process_image_url(self._session, url, max_gif_frames=4)
+                content_array.extend(items)
             # 存入数据库时序列化为 JSON 字符串
             await self._store.add_message(
                 session_key,
