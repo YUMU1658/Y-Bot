@@ -22,6 +22,7 @@ class ToolRegistry:
         _ws_server: WebSocket 服务端引用。
         _bot_info: Bot 信息缓存服务引用。
         _chat_log: 会话消息日志引用。
+        _enable_vision: 是否启用图片识别（传递给 ToolContext）。
     """
 
     def __init__(
@@ -29,11 +30,13 @@ class ToolRegistry:
         ws_server: Any,
         bot_info: Any,
         chat_log: Any,
+        enable_vision: bool = False,
     ) -> None:
         self._tools: dict[str, BaseTool] = {}
         self._ws_server = ws_server
         self._bot_info = bot_info
         self._chat_log = chat_log
+        self._enable_vision = enable_vision
 
     def register(self, tool: BaseTool) -> None:
         """注册一个工具。
@@ -95,6 +98,7 @@ class ToolRegistry:
             ws_server=self._ws_server,
             bot_info=self._bot_info,
             chat_log=self._chat_log,
+            enable_vision=self._enable_vision,
         )
 
         # 执行工具

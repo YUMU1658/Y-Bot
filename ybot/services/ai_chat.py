@@ -22,6 +22,7 @@ from ybot.services.reply_parser import ParsedAction
 from ybot.services.stream_parser import StreamActionParser
 from ybot.services.worldbook import WorldBookService
 from ybot.storage.conversation import ConversationStore
+from ybot.tools.base import ToolResult
 from ybot.utils.image_utils import process_image_url
 from ybot.utils.logger import get_logger
 
@@ -360,6 +361,7 @@ class AIChatService:
 
             # 执行每个 tool_call 并构建 tool result messages
             tool_results: list[tuple[dict[str, Any], str]] = []
+            tool_result_objects: list[ToolResult] = []
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
                 func = tc.get("function", {})
@@ -382,11 +384,29 @@ class AIChatService:
                 }
                 messages.append(tool_msg)
                 tool_results.append((tc, result.message))
+                tool_result_objects.append(result)
 
             # 将工具调用记录存入数据库
             await self._store_tool_messages(
                 prepared.session_key, assistant_msg, tool_results
             )
+
+            # 检查是否有工具返回了图片 URL，注入 multimodal user message
+            all_image_urls: list[str] = []
+            for result_obj in tool_result_objects:
+                if result_obj.image_urls:
+                    all_image_urls.extend(result_obj.image_urls)
+
+            if all_image_urls and self._config.enable_vision and self._session:
+                image_content: list[dict[str, Any]] = [
+                    {"type": "text", "text": "[以下是工具返回的图片]"}
+                ]
+                for url in all_image_urls:
+                    items = await process_image_url(
+                        self._session, url, max_gif_frames=4
+                    )
+                    image_content.extend(items)
+                messages.append({"role": "user", "content": image_content})
 
             # 更新 payload 中的 messages 并继续循环
             prepared.payload["messages"] = messages
@@ -634,6 +654,7 @@ class AIChatService:
 
                 # 执行工具并追加 tool result
                 tool_results: list[tuple[dict[str, Any], str]] = []
+                tool_result_objects: list[ToolResult] = []
                 for tc in accumulated_tool_calls:
                     # 检查取消信号（在工具执行之间检查）
                     if cancel_event and cancel_event.is_set():
@@ -661,6 +682,7 @@ class AIChatService:
                     }
                     messages.append(tool_msg)
                     tool_results.append((tc, result.message))
+                    tool_result_objects.append(result)
 
                 if cancelled:
                     # 被取消时不存储不完整的工具调用记录
@@ -670,6 +692,27 @@ class AIChatService:
                 await self._store_tool_messages(
                     prepared.session_key, assistant_msg, tool_results
                 )
+
+                # 检查是否有工具返回了图片 URL，注入 multimodal user message
+                all_tool_image_urls: list[str] = []
+                for result_obj in tool_result_objects:
+                    if result_obj.image_urls:
+                        all_tool_image_urls.extend(result_obj.image_urls)
+
+                if (
+                    all_tool_image_urls
+                    and self._config.enable_vision
+                    and self._session
+                ):
+                    image_content: list[dict[str, Any]] = [
+                        {"type": "text", "text": "[以下是工具返回的图片]"}
+                    ]
+                    for url in all_tool_image_urls:
+                        items = await process_image_url(
+                            self._session, url, max_gif_frames=4
+                        )
+                        image_content.extend(items)
+                    messages.append({"role": "user", "content": image_content})
 
                 # 重置 parser 以准备接收下一轮的文本回复
                 parser = StreamActionParser()

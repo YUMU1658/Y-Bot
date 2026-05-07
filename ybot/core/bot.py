@@ -55,6 +55,7 @@ from ybot.tools import ToolRegistry
 from ybot.tools.contact_info import ContactInfoTool
 from ybot.tools.group_info import GroupInfoTool
 from ybot.tools.recall_msg import RecallMsgTool
+from ybot.tools.viewer import ViewerTool
 from ybot.utils.logger import get_logger, setup_logger
 
 # 模块级 logger，用于 _send_reply 等非实例方法的日志
@@ -142,10 +143,12 @@ class Bot:
                 ws_server=self._ws_server,
                 bot_info=self._bot_info,
                 chat_log=self._chat_log,
+                enable_vision=config.ai.enable_vision,
             )
             self._tool_registry.register(RecallMsgTool())
             self._tool_registry.register(GroupInfoTool())
             self._tool_registry.register(ContactInfoTool())
+            self._tool_registry.register(ViewerTool())
 
         # 初始化 AI 对话服务（注入工具注册中心）
         self._ai_chat = AIChatService(

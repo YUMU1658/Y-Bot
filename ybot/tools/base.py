@@ -24,12 +24,14 @@ class ToolContext:
         ws_server: WebSocket 服务端引用，用于调用 OneBot API。
         bot_info: Bot 信息缓存服务，用于查询身份和群成员信息。
         chat_log: 群聊消息日志，用于标记撤回。
+        enable_vision: 是否启用图片识别（Vision），决定工具是否可以传递图片给 LLM。
     """
 
     session_key: str
     ws_server: WebSocketServer
     bot_info: BotInfoService
     chat_log: SessionChatLog
+    enable_vision: bool = False
 
 
 @dataclass
@@ -39,10 +41,14 @@ class ToolResult:
     Attributes:
         success: 是否全部成功。
         message: 返回给 LLM 的结果描述。
+        image_urls: 需要传递给 LLM 的图片 URL 列表（可选）。
+            当工具需要让 LLM 看到图片时填充此字段，
+            URL 可以是 QQ CDN 链接（由 ``process_image_url`` 下载转 base64）。
     """
 
     success: bool
     message: str
+    image_urls: list[str] | None = None
 
 
 class BaseTool(ABC):
