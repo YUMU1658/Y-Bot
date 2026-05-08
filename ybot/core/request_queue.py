@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypedDict
 
 from ybot.utils.logger import get_logger
 
@@ -24,16 +24,50 @@ ProcessCallback = Callable[["PendingRequest"], Awaitable[None]]
 InterruptCallback = Callable[[str, "QueuedMessage"], Awaitable[None]]
 
 
+class AIRequestContext(TypedDict, total=False):
+    """QueuedMessage.context_data 的类型定义。
+
+    使用 ``total=False`` 因为群聊和私聊有不同的字段集合。
+    此 TypedDict 主要用于文档和 IDE 提示，不强制运行时检查。
+
+    共有字段:
+        type: 消息类型（``"group"`` 或 ``"private"``）。
+        session_key: 会话标识（如 ``"group_12345"``）。
+        env_header: ENV 头部文本。
+        context_msg: 带参考聊天记录的 user 消息。
+        last_ref_id: 参考聊天记录去重边界 message_id。
+        image_urls: 当前消息中的图片 URL 列表。
+        display_name: 会话显示名称（群名/好友昵称）。
+        interrupt_hint: 打断上下文提示（截断器注入）。
+
+    群聊专有字段:
+        group_id: 群号。
+
+    私聊专有字段:
+        user_id: 用户 QQ 号。
+    """
+
+    type: str
+    session_key: str
+    env_header: str
+    context_msg: str
+    last_ref_id: int | None
+    image_urls: list[str]
+    display_name: str
+    interrupt_hint: str
+    # 群聊专有
+    group_id: int
+    # 私聊专有
+    user_id: int
+
+
 @dataclass
 class QueuedMessage:
     """队列中的单条消息。
 
     Attributes:
         formatted_msg: 已格式化的消息文本（带发送者元信息）。
-        context_data: 附加上下文数据，由调用方自由填充。
-            群消息典型字段: session_key, env_header, context_msg, last_ref_id,
-                           image_urls, send_func
-            私聊消息典型字段: session_key, env_header, image_urls, send_func
+        context_data: 附加上下文数据，结构参见 ``AIRequestContext``。
     """
 
     formatted_msg: str

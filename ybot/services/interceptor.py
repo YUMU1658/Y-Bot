@@ -14,6 +14,7 @@ from typing import Any
 import aiohttp
 
 from ybot.core.config import AIConfig, InterceptorConfig
+from ybot.services.llm_client import LLMClient
 from ybot.utils.logger import get_logger
 
 logger = get_logger("截断器")
@@ -64,7 +65,10 @@ class InterceptorService:
     """截断器服务 — 使用轻量模型判断是否打断当前回复。"""
 
     def __init__(
-        self, interceptor_config: InterceptorConfig, ai_config: AIConfig
+        self,
+        interceptor_config: InterceptorConfig,
+        ai_config: AIConfig,
+        llm_client: LLMClient | None = None,
     ) -> None:
         self._config = interceptor_config
         # 复用逻辑：api_base/api_key 为空时 fallback 到 ai_config
@@ -72,19 +76,25 @@ class InterceptorService:
         self._api_key = interceptor_config.api_key or ai_config.api_key
         self._model = interceptor_config.model
         self._timeout = interceptor_config.timeout
+        self._llm_client = llm_client
         self._session: aiohttp.ClientSession | None = None
 
     async def start(self) -> None:
         """初始化 HTTP 会话。"""
-        self._session = aiohttp.ClientSession()
+        if self._llm_client:
+            self._session = self._llm_client.session
+        else:
+            self._session = aiohttp.ClientSession()
         logger.info(f"截断器服务已初始化，模型: {self._model}")
 
     async def stop(self) -> None:
-        """关闭 HTTP 会话。"""
-        if self._session:
+        """关闭 HTTP 会话（仅在自管理模式下关闭）。"""
+        if self._llm_client:
+            self._session = None
+        elif self._session:
             await self._session.close()
             self._session = None
-            logger.info("截断器服务已关闭")
+        logger.info("截断器服务已关闭")
 
     async def should_interrupt(
         self,

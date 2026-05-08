@@ -7,16 +7,13 @@
 
 from __future__ import annotations
 
-import re
-
-from ybot.services.reply_parser import ParsedAction, ParsedMessage, ParsedPoke
-
-# 复用 reply_parser 中相同的正则模式
-_SEND_MSG_PATTERN = re.compile(
-    r'<send_msg(?:\s+reply_id="(\d+)")?\s*>(.*?)</send_msg>', re.DOTALL
+from ybot.services.reply_parser import (
+    _POKE_PATTERN,
+    _SEND_MSG_PATTERN,
+    ParsedAction,
+    ParsedMessage,
+    ParsedPoke,
 )
-
-_POKE_PATTERN = re.compile(r'<poke\s+target="(\d+)"\s*/>')
 
 _CLOSE_TAG = "</send_msg>"
 _CLOSE_TAG_LEN = len(_CLOSE_TAG)

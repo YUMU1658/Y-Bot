@@ -31,6 +31,10 @@ class MessageSegment:
         return segment_to_text(self)
 
 
+# 猜拳结果映射（模块级常量，避免在 match/case 内每次调用时重建）
+_RPS_MAP: dict[str, str] = {"1": "石头", "2": "剪刀", "3": "布"}
+
+
 def parse_message(message: list[dict[str, Any]]) -> list[MessageSegment]:
     """将 OneBot 的 message 数组解析为 MessageSegment 列表。
 
@@ -175,7 +179,6 @@ def segment_to_content(seg: MessageSegment) -> str:
             result = seg.data.get("result", "?")
             return f"[骰子:结果={result}]"
         case "rps":
-            _RPS_MAP = {"1": "石头", "2": "剪刀", "3": "布"}
             result = str(seg.data.get("result", "?"))
             result_text = _RPS_MAP.get(result, result)
             return f"[猜拳:结果={result_text}]"

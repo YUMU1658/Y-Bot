@@ -11,12 +11,14 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 
 import aiohttp
 
+from ybot.constants import TZ_CST
 from ybot.core.config import AIConfig
+from ybot.services.llm_client import LLMClient
 from ybot.services.preset import PresetManager
 from ybot.services.reply_parser import ParsedAction
 from ybot.services.stream_parser import StreamActionParser
@@ -28,11 +30,26 @@ from ybot.utils.logger import get_logger
 
 logger = get_logger("AI")
 
-# 北京时间 UTC+8
-_CST = timezone(timedelta(hours=8))
-
 # tool_calls 最大循环次数（防止无限循环）
 _MAX_TOOL_ROUNDS = 5
+
+
+@dataclass
+class ChatResult:
+    """AI 对话结果。
+
+    用于替代原先的错误字符串返回模式（``return "[AI 请求失败: ...]"``），
+    避免 LLM 回复以 ``[`` 开头时被误判为错误。
+
+    Attributes:
+        success: 是否成功获取到 AI 回复。
+        reply: AI 回复文本（成功时为回复内容，失败时为空字符串）。
+        error: 错误描述（成功时为 None）。
+    """
+
+    success: bool
+    reply: str = ""
+    error: str | None = None
 
 
 @dataclass
@@ -63,10 +80,12 @@ class AIChatService:
         store: ConversationStore,
         worldbook: WorldBookService | None = None,
         tool_registry: Any | None = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
         self._config = config
         self._store = store
-        self._session: aiohttp.ClientSession | None = None
+        self._llm_client = llm_client
+        self._session: aiohttp.ClientSession | None = None  # 兼容：无 llm_client 时自管理
         self._preset_manager = PresetManager(
             preset_dir=config.preset_dir,
             preset_name=config.preset_name,
@@ -78,17 +97,24 @@ class AIChatService:
     async def start(self) -> None:
         """初始化 HTTP 会话。
 
+        如果注入了 LLMClient，使用其会话；否则自行创建。
         必须在异步上下文中调用（事件循环已运行）。
         """
-        self._session = aiohttp.ClientSession()
+        if self._llm_client:
+            self._session = self._llm_client.session
+        else:
+            self._session = aiohttp.ClientSession()
         logger.info(f"AI 服务已初始化，模型: {self._config.model}")
 
     async def stop(self) -> None:
-        """关闭 HTTP 会话。"""
-        if self._session:
+        """关闭 HTTP 会话（仅在自管理模式下关闭）。"""
+        if self._llm_client:
+            # LLMClient 管理的会话由 LLMClient 关闭
+            self._session = None
+        elif self._session:
             await self._session.close()
             self._session = None
-            logger.info("AI 服务已关闭")
+        logger.info("AI 服务已关闭")
 
     # ---- 公共前置逻辑 ----
 
@@ -100,7 +126,7 @@ class AIChatService:
         last_ref_msg_id: int | None = None,
         image_urls: list[str] | None = None,
         display_name: str | None = None,
-    ) -> _PreparedChat | str:
+    ) -> _PreparedChat | ChatResult:
         """chat() 和 chat_stream() 的公共前置逻辑。
 
         执行步骤 1-3.7：存储用户消息、获取历史、构建跨会话记忆、
@@ -115,16 +141,16 @@ class AIChatService:
             display_name: 会话显示名称。
 
         Returns:
-            成功时返回 _PreparedChat；前置检查失败时返回错误提示字符串。
+            成功时返回 _PreparedChat；前置检查失败时返回 ChatResult(success=False)。
         """
         # 前置检查
         if not self._session:
             logger.error("AI 服务未初始化，请先调用 start()")
-            return "[AI 服务未初始化]"
+            return ChatResult(success=False, error="AI 服务未初始化")
 
         if not self._config.api_key:
             logger.warning("未配置 API 密钥，跳过 AI 调用")
-            return "[未配置 API 密钥]"
+            return ChatResult(success=False, error="未配置 API 密钥")
 
         # 1. 判断是否构建 multimodal content
         use_vision = (
@@ -233,7 +259,7 @@ class AIChatService:
         image_urls: list[str] | None = None,
         display_name: str | None = None,
         on_prepared: Callable[[list[dict[str, Any]]], None] | None = None,
-    ) -> str:
+    ) -> ChatResult:
         """发送多轮对话请求，返回 AI 回复文本（非流式）。
 
         流程：
@@ -253,14 +279,14 @@ class AIChatService:
             on_prepared: 可选回调，在 _prepare_chat 完成后调用，传递构建好的 messages 列表。
 
         Returns:
-            AI 回复的文本内容。
+            ChatResult 包含成功/失败状态和回复文本。
         """
         prepared = await self._prepare_chat(
             session_key, user_message, env_header,
             last_ref_msg_id, image_urls, display_name,
         )
-        # 前置检查失败时 _prepare_chat 返回错误字符串
-        if isinstance(prepared, str):
+        # 前置检查失败时 _prepare_chat 返回 ChatResult
+        if isinstance(prepared, ChatResult):
             return prepared
 
         # 注入 tools 参数（仅当 tool_registry 存在且有注册的工具时）
@@ -276,20 +302,20 @@ class AIChatService:
             reply = await self._chat_with_tools(prepared)
         except aiohttp.ClientError as e:
             logger.error(f"AI API 网络错误: {e}")
-            return "[AI 网络错误]"
+            return ChatResult(success=False, error="AI 网络错误")
         except Exception as e:
             logger.error(f"AI 调用时发生未知错误: {e}")
-            return "[AI 调用失败]"
+            return ChatResult(success=False, error="AI 调用失败")
 
         if reply.startswith("["):
-            # 错误消息，不存入数据库
-            return reply
+            # 内部错误消息（来自 _chat_with_tools），不存入数据库
+            return ChatResult(success=False, error=reply.strip("[]"))
 
         # 5. 存入 AI 回复
         await self._store.add_message(prepared.session_key, "assistant", reply)
 
         # 6. 返回
-        return reply
+        return ChatResult(success=True, reply=reply)
 
     async def _chat_with_tools(self, prepared: _PreparedChat) -> str:
         """执行 API 调用，处理 tool_calls 循环。
@@ -359,7 +385,7 @@ class AIChatService:
             assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
 
-            # 执行每个 tool_call 并构建 tool result messages
+            # 执行工具并注入结果
             tool_results: list[tuple[dict[str, Any], str]] = []
             tool_result_objects: list[ToolResult] = []
             for tc in tool_calls:
@@ -392,21 +418,7 @@ class AIChatService:
             )
 
             # 检查是否有工具返回了图片 URL，注入 multimodal user message
-            all_image_urls: list[str] = []
-            for result_obj in tool_result_objects:
-                if result_obj.image_urls:
-                    all_image_urls.extend(result_obj.image_urls)
-
-            if all_image_urls and self._config.enable_vision and self._session:
-                image_content: list[dict[str, Any]] = [
-                    {"type": "text", "text": "[以下是工具返回的图片]"}
-                ]
-                for url in all_image_urls:
-                    items = await process_image_url(
-                        self._session, url, max_gif_frames=4
-                    )
-                    image_content.extend(items)
-                messages.append({"role": "user", "content": image_content})
+            await self._inject_tool_images(tool_result_objects, messages)
 
             # 更新 payload 中的 messages 并继续循环
             prepared.payload["messages"] = messages
@@ -473,6 +485,97 @@ class AIChatService:
                 content_type="tool_result",
             )
 
+    async def _execute_tools(
+        self,
+        tool_calls: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        session_key: str,
+        assistant_content: str | None = None,
+        *,
+        log_prefix: str = "",
+    ) -> tuple[dict[str, Any], list[ToolResult]]:
+        """执行 tool_calls 并将结果追加到 messages 列表。
+
+        共享逻辑，供 ``_chat_with_tools`` 和 ``chat_stream`` 使用。
+
+        Args:
+            tool_calls: 累积的 tool_calls 列表。
+            messages: 当前 messages 列表（就地追加）。
+            session_key: 会话标识。
+            assistant_content: assistant 消息的文本内容（可能为 None）。
+            log_prefix: 日志前缀（如 "流式模式"）。
+
+        Returns:
+            (assistant_msg, tool_result_objects) 元组。
+        """
+        # 构建 assistant 消息（含 tool_calls）
+        assistant_msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": assistant_content,
+            "tool_calls": tool_calls,
+        }
+        messages.append(assistant_msg)
+
+        # 执行每个 tool_call 并构建 tool result messages
+        tool_results: list[tuple[dict[str, Any], str]] = []
+        tool_result_objects: list[ToolResult] = []
+        for tc in tool_calls:
+            tc_id = tc.get("id", "")
+            func = tc.get("function", {})
+            func_name = func.get("name", "")
+            func_args = func.get("arguments", "{}")
+
+            logger.debug(
+                f"{log_prefix}执行工具: {func_name}(id={tc_id}, args={func_args[:100]})"
+            )
+
+            result = await self._tool_registry.execute_tool_call(  # type: ignore[union-attr]
+                func_name, func_args, session_key
+            )
+
+            tool_msg: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": result.message,
+            }
+            messages.append(tool_msg)
+            tool_results.append((tc, result.message))
+            tool_result_objects.append(result)
+
+        # 将工具调用记录存入数据库
+        await self._store_tool_messages(session_key, assistant_msg, tool_results)
+
+        return assistant_msg, tool_result_objects
+
+    async def _inject_tool_images(
+        self,
+        tool_result_objects: list[ToolResult],
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """检查工具结果中的图片 URL，注入 multimodal user message。
+
+        共享逻辑，供 ``_chat_with_tools`` 和 ``chat_stream`` 使用。
+
+        Args:
+            tool_result_objects: 工具执行结果列表。
+            messages: 当前 messages 列表（就地追加）。
+        """
+        all_image_urls: list[str] = []
+        for result_obj in tool_result_objects:
+            if result_obj.image_urls:
+                all_image_urls.extend(result_obj.image_urls)
+
+        if all_image_urls and self._config.enable_vision and self._session:
+            image_content: list[dict[str, Any]] = [
+                {"type": "text", "text": "[以下是工具返回的图片]"}
+            ]
+            for url in all_image_urls:
+                items = await process_image_url(
+                    self._session, url, max_gif_frames=4
+                )
+                image_content.extend(items)
+            messages.append({"role": "user", "content": image_content})
+
     @staticmethod
     def _accumulate_tool_call_deltas(
         accumulated: list[dict[str, Any]], deltas: list[dict[str, Any]]
@@ -519,7 +622,7 @@ class AIChatService:
         cancel_event: asyncio.Event | None = None,
         on_partial: Callable[[str], None] | None = None,
         on_prepared: Callable[[list[dict[str, Any]]], None] | None = None,
-    ) -> str:
+    ) -> ChatResult:
         """流式对话请求。
 
         与 chat() 共享前置逻辑，但 API 调用使用 stream=True。
@@ -540,13 +643,13 @@ class AIChatService:
             on_prepared: 可选回调，在 _prepare_chat 完成后调用，传递构建好的 messages 列表。
 
         Returns:
-            完整的 AI 回复文本（用于日志/调试）。
+            ChatResult 包含成功/失败状态和完整的 AI 回复文本。
         """
         prepared = await self._prepare_chat(
             session_key, user_message, env_header,
             last_ref_msg_id, image_urls, display_name,
         )
-        if isinstance(prepared, str):
+        if isinstance(prepared, ChatResult):
             return prepared
 
         # 注入 tools 参数（与 chat() 一致）
@@ -585,7 +688,7 @@ class AIChatService:
                         logger.error(
                             f"AI API 流式请求失败 (HTTP {resp.status}): {error_text[:200]}"
                         )
-                        return f"[AI 请求失败: HTTP {resp.status}]"
+                        return ChatResult(success=False, error=f"AI 请求失败: HTTP {resp.status}")
 
                     async for raw_line in resp.content:
                         # 检查取消信号
@@ -694,25 +797,7 @@ class AIChatService:
                 )
 
                 # 检查是否有工具返回了图片 URL，注入 multimodal user message
-                all_tool_image_urls: list[str] = []
-                for result_obj in tool_result_objects:
-                    if result_obj.image_urls:
-                        all_tool_image_urls.extend(result_obj.image_urls)
-
-                if (
-                    all_tool_image_urls
-                    and self._config.enable_vision
-                    and self._session
-                ):
-                    image_content: list[dict[str, Any]] = [
-                        {"type": "text", "text": "[以下是工具返回的图片]"}
-                    ]
-                    for url in all_tool_image_urls:
-                        items = await process_image_url(
-                            self._session, url, max_gif_frames=4
-                        )
-                        image_content.extend(items)
-                    messages.append({"role": "user", "content": image_content})
+                await self._inject_tool_images(tool_result_objects, messages)
 
                 # 重置 parser 以准备接收下一轮的文本回复
                 parser = StreamActionParser()
@@ -737,7 +822,7 @@ class AIChatService:
                         logger.error(
                             f"AI API 最终流式请求失败 (HTTP {resp.status}): {error_text[:200]}"
                         )
-                        return f"[AI 请求失败: HTTP {resp.status}]"
+                        return ChatResult(success=False, error=f"AI 请求失败: HTTP {resp.status}")
 
                     async for raw_line in resp.content:
                         if cancel_event and cancel_event.is_set():
@@ -769,10 +854,10 @@ class AIChatService:
 
         except aiohttp.ClientError as e:
             logger.error(f"AI API 流式网络错误: {e}")
-            return "[AI 网络错误]"
+            return ChatResult(success=False, error="AI 网络错误")
         except Exception as e:
             logger.error(f"AI 流式调用时发生未知错误: {e}")
-            return "[AI 调用失败]"
+            return ChatResult(success=False, error="AI 调用失败")
 
         # 获取完整回复
         reply = parser.get_full_response()
@@ -782,7 +867,7 @@ class AIChatService:
             # 5. 存入 AI 回复
             await self._store.add_message(prepared.session_key, "assistant", reply)
 
-        return reply
+        return ChatResult(success=True, reply=reply)
 
     async def update_last_assistant_reply(
         self, session_key: str, new_content: str
@@ -826,7 +911,7 @@ class AIChatService:
             messages = session_data["messages"]
 
             # 格式化会话标识和时间
-            dt = datetime.fromtimestamp(invoked_at, tz=_CST)
+            dt = datetime.fromtimestamp(invoked_at, tz=TZ_CST)
             time_str = dt.strftime("%Y-%m-%d %H:%M")
 
             lines.append("")

@@ -47,18 +47,31 @@ class SessionChatLog:
     按 session_key 索引，每个会话维护一个有序的消息列表（按时间排序），
     内存中保留最近 ``buffer_size`` 条记录。
     统一覆盖群聊、私聊、临时私聊场景。
+
+    维护一个全局 ``_msg_index`` 字典（message_id → ChatLogEntry），
+    用于 O(1) 查找撤回标记等操作，替代原先的 O(N×M) 全量扫描。
     """
 
     def __init__(self, buffer_size: int = 100) -> None:
         self._buffer_size = buffer_size
         self._logs: dict[str, deque[ChatLogEntry]] = {}
+        # 全局 message_id → entry 索引，用于 O(1) 查找
+        self._msg_index: dict[int, ChatLogEntry] = {}
 
     def add(self, entry: ChatLogEntry) -> None:
         """添加一条聊天记录。"""
         key = entry.session_key
         if key not in self._logs:
             self._logs[key] = deque(maxlen=self._buffer_size)
-        self._logs[key].append(entry)
+
+        buf = self._logs[key]
+        # 如果 deque 已满，即将被淘汰的条目需要从索引中移除
+        if len(buf) == buf.maxlen:
+            evicted = buf[0]
+            self._msg_index.pop(evicted.message_id, None)
+
+        buf.append(entry)
+        self._msg_index[entry.message_id] = entry
 
     def get_recent(self, session_key: str, limit: int = 20) -> list[ChatLogEntry]:
         """获取最近 N 条聊天记录。
@@ -85,9 +98,10 @@ class SessionChatLog:
         Returns:
             如果该会话的缓冲区中存在该 message_id 则返回 True，否则返回 False。
         """
-        if session_key not in self._logs:
+        entry = self._msg_index.get(message_id)
+        if entry is None:
             return False
-        return any(e.message_id == message_id for e in self._logs[session_key])
+        return entry.session_key == session_key
 
     def get_between(
         self,
@@ -136,18 +150,15 @@ class SessionChatLog:
     def mark_recalled(self, message_id: int, hint: str = "已撤回") -> None:
         """将指定消息标记为已撤回。
 
-        遍历所有会话的缓冲区，找到对应 message_id 的条目并标记。
-        message_id 全局唯一，找到后立即返回。
+        通过 ``_msg_index`` 实现 O(1) 查找。
 
         Args:
             message_id: 被撤回消息的 message_id。
             hint: 撤回提示文本（如"张三撤回了这条消息"）。
         """
-        for entries in self._logs.values():
-            for entry in entries:
-                if entry.message_id == message_id:
-                    entry.recall_hint = hint
-                    return
+        entry = self._msg_index.get(message_id)
+        if entry is not None:
+            entry.recall_hint = hint
 
     def is_recalled(self, message_id: int) -> bool:
         """查询指定消息是否已被标记为撤回。
@@ -158,11 +169,10 @@ class SessionChatLog:
         Returns:
             如果消息在缓冲区中且已标记为撤回则返回 True，否则返回 False。
         """
-        for entries in self._logs.values():
-            for entry in entries:
-                if entry.message_id == message_id:
-                    return bool(entry.recall_hint)
-        return False
+        entry = self._msg_index.get(message_id)
+        if entry is None:
+            return False
+        return bool(entry.recall_hint)
 
     def get_recall_hint(self, message_id: int) -> str:
         """获取指定消息的撤回提示文本。
@@ -173,8 +183,7 @@ class SessionChatLog:
         Returns:
             撤回提示文本，未撤回或未找到返回空字符串。
         """
-        for entries in self._logs.values():
-            for entry in entries:
-                if entry.message_id == message_id:
-                    return entry.recall_hint
-        return ""
+        entry = self._msg_index.get(message_id)
+        if entry is None:
+            return ""
+        return entry.recall_hint

@@ -66,7 +66,7 @@ class ServerConfig:
     """WebSocket 服务端配置。"""
 
     host: str = "localhost"
-    port: int = 8080
+    port: int = 21050
     access_token: str = ""
 
 
@@ -182,7 +182,7 @@ class Config:
 
         server = ServerConfig(
             host=server_data.get("host", "localhost"),
-            port=server_data.get("port", 8080),
+            port=server_data.get("port", 21050),
             access_token=server_data.get("access_token", ""),
         )
         bot = BotConfig(

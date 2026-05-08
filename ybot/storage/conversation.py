@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from typing import Any
 
@@ -81,6 +82,10 @@ class ConversationStore:
         """
         os.makedirs(os.path.dirname(self._db_path), exist_ok=True)
         self._db = await aiosqlite.connect(self._db_path)
+
+        # 启用 WAL 模式提升并发读性能
+        await self._db.execute("PRAGMA journal_mode=WAL")
+
         await self._db.executescript(_CREATE_TABLES_SQL)
         await self._db.commit()
 
@@ -88,7 +93,7 @@ class ConversationStore:
         try:
             await self._db.execute(_MIGRATION_ADD_LAST_REF_MSG_ID)
             await self._db.commit()
-        except Exception:
+        except sqlite3.OperationalError:
             # 列已存在时 SQLite 会抛出 OperationalError，忽略即可
             pass
 
@@ -96,21 +101,21 @@ class ConversationStore:
         try:
             await self._db.execute(_MIGRATION_ADD_CONTENT_TYPE)
             await self._db.commit()
-        except Exception:
+        except sqlite3.OperationalError:
             pass
 
         # 迁移：为已有数据库添加 last_invoked_at 列（跨会话记忆）
         try:
             await self._db.execute(_MIGRATION_ADD_LAST_INVOKED_AT)
             await self._db.commit()
-        except Exception:
+        except sqlite3.OperationalError:
             pass
 
         # 迁移：为已有数据库添加 display_name 列（跨会话记忆）
         try:
             await self._db.execute(_MIGRATION_ADD_DISPLAY_NAME)
             await self._db.commit()
-        except Exception:
+        except sqlite3.OperationalError:
             pass
 
         logger.info(f"对话存储已初始化: {self._db_path}")
@@ -140,7 +145,8 @@ class ConversationStore:
             last_ref_msg_id: 本轮参考聊天记录中最新一条的 message_id（仅 role=user 时有意义）。
             content_type: 内容类型（``text`` / ``multimodal`` / ``tool_calls`` / ``tool_result``）。
         """
-        assert self._db is not None, "ConversationStore 未初始化"
+        if not self._db:
+            raise RuntimeError("ConversationStore 未初始化，请先调用 initialize()")
 
         now = time.time()
 
@@ -161,7 +167,8 @@ class ConversationStore:
             (session_key,),
         )
         row = await cursor.fetchone()
-        assert row is not None
+        if row is None:
+            raise RuntimeError(f"无法获取 session_id (session_key={session_key})")
         session_id: int = row[0]
 
         # 插入消息
@@ -195,7 +202,8 @@ class ConversationStore:
             按时间升序排列的消息列表，每条为
             ``{"role": "user"|"assistant"|"tool", "content": "..." | [...]}``.
         """
-        assert self._db is not None, "ConversationStore 未初始化"
+        if not self._db:
+            raise RuntimeError("ConversationStore 未初始化，请先调用 initialize()")
 
         # 子查询取最近 N 条（DESC），外层再按时间正序排列
         cursor = await self._db.execute(
@@ -320,7 +328,8 @@ class ConversationStore:
         Returns:
             最近一条 user 消息的 last_ref_msg_id，如果不存在则返回 None。
         """
-        assert self._db is not None, "ConversationStore 未初始化"
+        if not self._db:
+            raise RuntimeError("ConversationStore 未初始化，请先调用 initialize()")
 
         cursor = await self._db.execute(
             "SELECT m.last_ref_msg_id "
@@ -345,7 +354,8 @@ class ConversationStore:
             session_key: 会话标识。
             display_name: 会话显示名称（如群名、好友昵称）。
         """
-        assert self._db is not None, "ConversationStore 未初始化"
+        if not self._db:
+            raise RuntimeError("ConversationStore 未初始化，请先调用 initialize()")
 
         now = time.time()
         if display_name is not None:
@@ -383,7 +393,8 @@ class ConversationStore:
             - last_invoked_at: 最后唤醒时间戳
             - messages: 该会话的最近消息列表
         """
-        assert self._db is not None, "ConversationStore 未初始化"
+        if not self._db:
+            raise RuntimeError("ConversationStore 未初始化，请先调用 initialize()")
 
         if decay_limits is None:
             decay_limits = [20, 15, 10, 5, 3]
@@ -418,7 +429,8 @@ class ConversationStore:
         Args:
             session_key: 会话标识。
         """
-        assert self._db is not None, "ConversationStore 未初始化"
+        if not self._db:
+            raise RuntimeError("ConversationStore 未初始化，请先调用 initialize()")
 
         cursor = await self._db.execute(
             "SELECT id FROM sessions WHERE session_key = ?",
@@ -446,7 +458,8 @@ class ConversationStore:
             session_key: 会话标识。
             new_content: 替换后的消息内容。
         """
-        assert self._db is not None, "ConversationStore 未初始化"
+        if not self._db:
+            raise RuntimeError("ConversationStore 未初始化，请先调用 initialize()")
 
         cursor = await self._db.execute(
             "SELECT m.id FROM messages m "

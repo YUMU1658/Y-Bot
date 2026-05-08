@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ybot.constants import VALID_ROLES
 from ybot.utils.logger import get_logger
 
 logger = get_logger("WorldBook")
@@ -148,8 +149,6 @@ _VALID_WB_POSITIONS = {
     "assistant_before",
     "assistant_after",
 }
-
-_VALID_ROLES = {"system", "user", "assistant"}
 
 
 class WorldBookService:
@@ -765,7 +764,7 @@ class WorldBookService:
             position = "system_after"
 
         role = str(insertion_data.get("role", "system"))
-        if role not in _VALID_ROLES:
+        if role not in VALID_ROLES:
             logger.warning(
                 f"世界书条目 {raw.get('id', '?')} 使用了未知角色 '{role}'，"
                 f"回退到 'system'"

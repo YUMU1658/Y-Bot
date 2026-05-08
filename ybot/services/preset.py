@@ -8,21 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ybot.constants import VALID_POSITIONS, VALID_ROLES
 from ybot.utils.logger import get_logger
 
 logger = get_logger("Preset")
-
-_VALID_ROLES = {"system", "user", "assistant"}
-_VALID_POSITIONS = {
-    "system_before",
-    "system_after",
-    "user_before",
-    "user_after",
-    "assistant_before",
-    "assistant_after",
-    "messages_start",
-    "messages_end",
-}
 
 _FALLBACK_OUTPUT_PROTOCOL = """\
 # 输出协议
@@ -383,10 +372,10 @@ class PresetManager:
         for entry in preset.entries:
             if not entry.enabled:
                 continue
-            if entry.role not in _VALID_ROLES:
+            if entry.role not in VALID_ROLES:
                 logger.warning(f"跳过未知 role 的预设条目 {entry.id}: {entry.role}")
                 continue
-            if entry.position not in _VALID_POSITIONS:
+            if entry.position not in VALID_POSITIONS:
                 logger.warning(f"跳过未知 position 的预设条目 {entry.id}: {entry.position}")
                 continue
             if not entry.content.strip():

@@ -6,36 +6,17 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ybot.constants import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, ROLE_LABEL_MAP
+from ybot.tools._common import format_timestamp
 from ybot.tools.base import BaseTool, ToolContext, ToolResult
 from ybot.utils.logger import get_logger
 
 logger = get_logger("群信息工具")
 
 # ── 常量 ──
-_DEFAULT_LIMIT = 50
-_MAX_LIMIT = 200
 _ROLE_PRIORITY: dict[str, int] = {"owner": 0, "admin": 1, "member": 2}
-_ROLE_LABEL: dict[str, str] = {
-    "owner": "群主",
-    "admin": "管理员",
-    "member": "成员",
-}
-# 东八区时区
-_TZ_CST = timezone(timedelta(hours=8))
-
-
-def _format_timestamp(ts: int) -> str:
-    """将 Unix 时间戳格式化为可读时间。"""
-    if not ts:
-        return "未知"
-    try:
-        dt = datetime.fromtimestamp(ts, tz=_TZ_CST)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except (OSError, ValueError):
-        return "未知"
 
 
 def _normalize_level(raw: Any) -> str:
@@ -317,8 +298,8 @@ class GroupInfoTool(BaseTool):
         # 4. 分页截取
         offset = max(0, int(arguments.get("offset", 0)))
         limit = min(
-            max(1, int(arguments.get("limit", _DEFAULT_LIMIT))),
-            _MAX_LIMIT,
+            max(1, int(arguments.get("limit", DEFAULT_PAGE_LIMIT))),
+            MAX_PAGE_LIMIT,
         )
 
         # offset 超出范围
@@ -471,8 +452,8 @@ class GroupInfoTool(BaseTool):
         """返回角色筛选条件的中文描述。"""
         if role_filter == "admin+":
             return "管理层（群主+管理员）"
-        if role_filter in _ROLE_LABEL:
-            return _ROLE_LABEL[role_filter]
+        if role_filter in ROLE_LABEL_MAP:
+            return ROLE_LABEL_MAP[role_filter]
         return ""
 
     # ──────────────────────────────────────────────
@@ -534,7 +515,7 @@ class GroupInfoTool(BaseTool):
             lines.append(f"· 群名片：{card}")
 
         role = _normalize_role(data.get("role"))
-        lines.append(f"· 角色：{_ROLE_LABEL.get(role, role)}")
+        lines.append(f"· 角色：{ROLE_LABEL_MAP.get(role, role)}")
 
         # 等级
         level = _normalize_level(data.get("level"))
@@ -566,11 +547,11 @@ class GroupInfoTool(BaseTool):
 
         join_time = data.get("join_time")
         if join_time:
-            lines.append(f"· 入群时间：{_format_timestamp(join_time)}")
+            lines.append(f"· 入群时间：{format_timestamp(join_time)}")
 
         last_sent = data.get("last_sent_time")
         if last_sent:
-            lines.append(f"· 最后发言：{_format_timestamp(last_sent)}")
+            lines.append(f"· 最后发言：{format_timestamp(last_sent)}")
 
         # 好友状态
         try:
@@ -582,7 +563,7 @@ class GroupInfoTool(BaseTool):
         # 禁言状态
         shut_up = data.get("shut_up_timestamp", 0)
         if shut_up and shut_up > 0:
-            lines.append(f"· 禁言到期：{_format_timestamp(shut_up)}")
+            lines.append(f"· 禁言到期：{format_timestamp(shut_up)}")
 
         area = data.get("area")
         if area:
@@ -651,7 +632,7 @@ class GroupInfoTool(BaseTool):
 
         create_time = data.get("groupCreateTime") or data.get("group_create_time")
         if create_time:
-            lines.append(f"· 创建时间：{_format_timestamp(create_time)}")
+            lines.append(f"· 创建时间：{format_timestamp(create_time)}")
 
         group_level = data.get("group_level") or data.get("groupGrade")
         if group_level:

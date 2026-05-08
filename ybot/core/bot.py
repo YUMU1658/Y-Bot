@@ -9,13 +9,13 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
-import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any
 
 from ybot import __version__
+from ybot.constants import TZ_CST
 from ybot.core.config import Config
 from ybot.core.request_queue import PendingRequest, QueuedMessage, RequestQueue
 from ybot.core.ws_server import WebSocketServer
@@ -35,11 +35,12 @@ from ybot.models.message import (
     segments_to_content,
     segments_to_text,
 )
-from ybot.services.ai_chat import AIChatService
+from ybot.services.ai_chat import AIChatService, ChatResult
 from ybot.services.bot_info import BotInfoService
 from ybot.services.env_builder import EnvBuilder, MessageFormatter
 from ybot.services.interceptor import InterceptorService
-from ybot.services.message_builder import text_to_segments
+from ybot.services.llm_client import LLMClient
+from ybot.services.message_sender import MessageSender, _next_poke_id
 from ybot.services.poke_limiter import PokeLimiter
 from ybot.services.reply_parser import (
     ParsedAction,
@@ -61,16 +62,6 @@ from ybot.utils.logger import get_logger, setup_logger
 # 模块级 logger，用于 _send_reply 等非实例方法的日志
 _logger = get_logger("Bot")
 
-# 戳一戳伪 message_id 计数器（负数，避免与正整数的真实 message_id 冲突）
-_poke_id_counter: int = 0
-
-
-def _next_poke_id() -> int:
-    """生成下一个戳一戳伪 message_id（递减负数）。"""
-    global _poke_id_counter
-    _poke_id_counter -= 1
-    return _poke_id_counter
-
 
 @dataclass
 class _ActiveTask:
@@ -80,6 +71,26 @@ class _ActiveTask:
     context_messages: list[dict[str, Any]] | None = None  # 发送给主模型的完整 messages
     partial_response: str = ""  # 流式模式下已累积的部分回复
     completed: bool = False  # 是否已完成处理
+
+
+@dataclass
+class _PreparedAIRequest:
+    """_process_ai_request 和 _process_ai_request_stream 的共享准备结果。
+
+    将两个方法中 ~60 行完全相同的准备代码提取为此数据类，
+    包含所有准备好的字段。
+    """
+
+    session_key: str
+    env_header: str
+    msg_type: str
+    user_message: str
+    last_ref_id: int | None
+    all_image_urls: list[str]
+    send_func: Callable[[str, int | None], Awaitable[int | None]]
+    poke_func: Callable[[int], Awaitable[tuple[bool, str]]]
+    display_name: str | None
+    active_task: _ActiveTask | None
 
 
 class Bot:
@@ -136,6 +147,14 @@ class Bot:
             daily_limit=config.poke.daily_limit,
         )
 
+        # 初始化消息发送服务
+        self._msg_sender = MessageSender(
+            ws_server=self._ws_server,
+            bot_info=self._bot_info,
+            chat_log=self._chat_log,
+            poke_limiter=self._poke_limiter,
+        )
+
         # 初始化工具注册中心（仅当配置启用时）
         self._tool_registry: ToolRegistry | None = None
         if config.tools.enabled:
@@ -150,10 +169,13 @@ class Bot:
             self._tool_registry.register(ContactInfoTool())
             self._tool_registry.register(ViewerTool())
 
-        # 初始化 AI 对话服务（注入工具注册中心）
+        # 初始化共享 LLM HTTP 客户端
+        self._llm_client = LLMClient()
+
+        # 初始化 AI 对话服务（注入工具注册中心和共享 HTTP 客户端）
         self._ai_chat = AIChatService(
             config.ai, self._conv_store, worldbook=self._worldbook,
-            tool_registry=self._tool_registry,
+            tool_registry=self._tool_registry, llm_client=self._llm_client,
         )
 
         # 初始化防抖 + 单线程请求队列
@@ -162,7 +184,9 @@ class Bot:
         # 初始化截断器服务
         self._interceptor: InterceptorService | None = None
         if config.interceptor.enabled:
-            self._interceptor = InterceptorService(config.interceptor, config.ai)
+            self._interceptor = InterceptorService(
+                config.interceptor, config.ai, llm_client=self._llm_client
+            )
             self._request_queue.set_interrupt_callback(self._on_interrupt_check)
 
         # 截断器状态：session_key → 当前处理任务的取消控制
@@ -202,6 +226,7 @@ class Bot:
 
         # 启动 AI 服务（需在事件循环中创建 aiohttp 会话）
         await self._conv_store.initialize()
+        await self._llm_client.start()
         await self._ai_chat.start()
         if self._interceptor:
             await self._interceptor.start()
@@ -239,6 +264,7 @@ class Bot:
         if self._interceptor:
             await self._interceptor.stop()
         await self._ai_chat.stop()
+        await self._llm_client.stop()
         await self._conv_store.close()
         self._logger.info("Y-BOT 已关闭")
 
@@ -478,46 +504,25 @@ class Bot:
     async def _write_poke_chat_log(
         self, *, session_key: str, poke_text: str
     ) -> None:
-        """将 bot 主动发起的戳一戳写入 ChatLog。
-
-        Args:
-            session_key: 会话标识。
-            poke_text: 互动文案（如 "Bot名(QQ号) 戳了戳 目标QQ号"）。
-        """
-        login_info = await self._bot_info.get_login_info()
-        entry = ChatLogEntry(
-            message_id=_next_poke_id(),
-            session_key=session_key,
-            user_id=login_info.user_id,
-            nickname=login_info.nickname or str(login_info.user_id),
-            card="",
-            role="",
-            level="",
-            title="",
-            is_friend=False,
-            timestamp=time.time(),
-            text=poke_text,
-            is_bot=True,
-            entry_type="poke",
+        """将 bot 主动发起的戳一戳写入 ChatLog（委托给 MessageSender）。"""
+        await self._msg_sender.write_poke_chat_log(
+            session_key=session_key, poke_text=poke_text
         )
-        self._chat_log.add(entry)
 
-    # ---- 流式请求处理 ----
+    # ---- AI 请求准备（共享逻辑） ----
 
-    async def _process_ai_request_stream(self, request: PendingRequest) -> None:
-        """流式模式的 AI 请求处理。
+    def _prepare_ai_request(self, request: PendingRequest) -> _PreparedAIRequest:
+        """提取 _process_ai_request 和 _process_ai_request_stream 的共享准备逻辑。
 
-        使用 asyncio.Queue 作为动作管道（生产者-消费者模式）：
-        - 生产者：LLM 流式回调将 ParsedAction 放入队列
-        - 消费者：sender_worker 从队列取动作，按 1 秒间隔执行
-
-        与 ``_process_ai_request()`` 共享前置的上下文构建逻辑，
-        仅在 API 调用和消息发送部分不同。
+        构建 send_func、poke_func、user_message、合并图片 URL、
+        注入打断提示、注册截断器活跃任务。
 
         Args:
             request: 包含一条或多条合并消息的待处理请求。
+
+        Returns:
+            包含所有准备好字段的 _PreparedAIRequest。
         """
-        # ---- 共享前置逻辑：构建 send_func、user_message 等 ----
         last_msg = request.messages[-1]
         data = last_msg.context_data
         session_key = data["session_key"]
@@ -546,19 +551,16 @@ class Bot:
             poke_func = lambda tid: self.send_poke(tid, None)
 
         if len(request.messages) == 1:
-            # ---- 单条消息：直接使用已预处理的数据 ----
+            # 单条消息：直接使用已预处理的数据
             user_message = data["context_msg"]
             last_ref_id = data.get("last_ref_id")
         else:
-            # ---- 多条消息合并 ----
-            # 第一条消息的 context_msg 包含完整的聊天记录引用 + 第一条格式化消息
-            # 后续消息只需追加其 formatted_msg
+            # 多条消息合并
             first_data = request.messages[0].context_data
             parts = [first_data["context_msg"]]
             for m in request.messages[1:]:
                 parts.append(m.formatted_msg)
             user_message = "\n".join(parts)
-            # last_ref_id 使用最后一条消息的值
             last_ref_id = data.get("last_ref_id")
 
         # 注入打断提示（如果有）
@@ -566,18 +568,48 @@ class Bot:
         if interrupt_hint:
             user_message = interrupt_hint + "\n\n" + user_message
 
-        # ---- 截断器：注册活跃任务 ----
+        # 截断器：注册活跃任务
         active_task: _ActiveTask | None = None
         if self._interceptor:
             active_task = _ActiveTask(cancel_event=asyncio.Event())
             self._active_tasks[session_key] = active_task
+
+        return _PreparedAIRequest(
+            session_key=session_key,
+            env_header=env_header,
+            msg_type=msg_type,
+            user_message=user_message,
+            last_ref_id=last_ref_id,
+            all_image_urls=all_image_urls,
+            send_func=send_func,
+            poke_func=poke_func,
+            display_name=data.get("display_name"),
+            active_task=active_task,
+        )
+
+    # ---- 流式请求处理 ----
+
+    async def _process_ai_request_stream(self, request: PendingRequest) -> None:
+        """流式模式的 AI 请求处理。
+
+        使用 asyncio.Queue 作为动作管道（生产者-消费者模式）：
+        - 生产者：LLM 流式回调将 ParsedAction 放入队列
+        - 消费者：sender_worker 从队列取动作，按 1 秒间隔执行
+
+        与 ``_process_ai_request()`` 共享前置的上下文构建逻辑，
+        仅在 API 调用和消息发送部分不同。
+
+        Args:
+            request: 包含一条或多条合并消息的待处理请求。
+        """
+        prep = self._prepare_ai_request(request)
+        active_task = prep.active_task
 
         # ---- 流式特有逻辑：生产者-消费者模式 ----
         action_queue: asyncio.Queue[ParsedAction | None] = asyncio.Queue()
         sent_messages: list[str] = []  # 追踪已发送的消息
         # 收集戳一戳替换结果：(原始标签文本, 替换文本)
         poke_replacements: list[tuple[str, str]] = []
-        stream_session_key = data["session_key"]
 
         async def on_action(action: ParsedAction) -> None:
             """流式回调：将完整动作放入队列。"""
@@ -605,15 +637,15 @@ class Bot:
                     break
 
                 if isinstance(action, ParsedMessage):
-                    await send_func(action.content, action.reply_id)
+                    await prep.send_func(action.content, action.reply_id)
                     sent_messages.append(action.content)
                 elif isinstance(action, ParsedPoke):
-                    success, text = await poke_func(action.target_id)
+                    success, text = await prep.poke_func(action.target_id)
                     original_tag = f'<poke target="{action.target_id}"/>'
                     if success:
                         replacement = f"[💢戳一戳] {text}"
                         await self._write_poke_chat_log(
-                            session_key=stream_session_key, poke_text=text
+                            session_key=prep.session_key, poke_text=text
                         )
                     else:
                         replacement = f"[戳一戳失败: {text}]"
@@ -623,13 +655,13 @@ class Bot:
         sender_task = asyncio.create_task(sender_worker())
 
         try:
-            reply = await self._ai_chat.chat_stream(
-                session_key,
-                user_message,
-                env_header,
-                last_ref_msg_id=last_ref_id,
-                image_urls=all_image_urls or None,
-                display_name=data.get("display_name"),
+            result = await self._ai_chat.chat_stream(
+                prep.session_key,
+                prep.user_message,
+                prep.env_header,
+                last_ref_msg_id=prep.last_ref_id,
+                image_urls=prep.all_image_urls or None,
+                display_name=prep.display_name,
                 on_action=on_action,
                 cancel_event=active_task.cancel_event if active_task else None,
                 on_partial=on_partial if active_task else None,
@@ -644,14 +676,20 @@ class Bot:
         # ---- 截断器：检查是否被打断 ----
         if active_task:
             active_task.completed = True
-            self._active_tasks.pop(session_key, None)
+            self._active_tasks.pop(prep.session_key, None)
 
             if active_task.cancel_event.is_set():
-                _logger.info(f"流式回复被打断，重新处理 (session={session_key})")
+                _logger.info(f"流式回复被打断，重新处理 (session={prep.session_key})")
                 await self._reprocess_after_interrupt(
-                    request, session_key, sent_messages=sent_messages or None
+                    request, prep.session_key, sent_messages=sent_messages or None
                 )
                 return
+
+        if not result.success:
+            _logger.warning(f"流式 AI 请求失败: {result.error}")
+            return
+
+        reply = result.reply
 
         # 替换回复文本中的 poke 标签并更新数据库存储
         if poke_replacements and reply:
@@ -684,60 +722,9 @@ class Bot:
         if self.config.ai.enable_stream:
             await self._process_ai_request_stream(request)
             return
-        # 使用最后一条消息的上下文数据（最新状态）
-        last_msg = request.messages[-1]
-        data = last_msg.context_data
-        session_key = data["session_key"]
-        env_header = data["env_header"]
-        msg_type = data["type"]
 
-        # 合并所有消息的图片 URL
-        all_image_urls: list[str] = []
-        for m in request.messages:
-            urls = m.context_data.get("image_urls", [])
-            if urls:
-                all_image_urls.extend(urls)
-
-        # 构建发送函数和 poke 函数
-        if msg_type == "group":
-            group_id = data["group_id"]
-            send_func = lambda msg, rid=None, gid=group_id, sk=session_key: self.send_group_msg(
-                gid, msg, rid, session_key=sk
-            )
-            poke_func = lambda tid, gid=group_id: self.send_poke(tid, gid)
-        else:
-            user_id = data["user_id"]
-            send_func = lambda msg, rid=None, uid=user_id, sk=session_key: self.send_private_msg(
-                uid, msg, rid, session_key=sk
-            )
-            poke_func = lambda tid: self.send_poke(tid, None)
-
-        if len(request.messages) == 1:
-            # ---- 单条消息：直接使用已预处理的数据 ----
-            user_message = data["context_msg"]
-            last_ref_id = data.get("last_ref_id")
-        else:
-            # ---- 多条消息合并 ----
-            # 第一条消息的 context_msg 包含完整的聊天记录引用 + 第一条格式化消息
-            # 后续消息只需追加其 formatted_msg
-            first_data = request.messages[0].context_data
-            parts = [first_data["context_msg"]]
-            for m in request.messages[1:]:
-                parts.append(m.formatted_msg)
-            user_message = "\n".join(parts)
-            # last_ref_id 使用最后一条消息的值
-            last_ref_id = data.get("last_ref_id")
-
-        # 注入打断提示（如果有）
-        interrupt_hint = request.messages[0].context_data.get("interrupt_hint")
-        if interrupt_hint:
-            user_message = interrupt_hint + "\n\n" + user_message
-
-        # 截断器：注册活跃任务
-        active_task: _ActiveTask | None = None
-        if self._interceptor:
-            active_task = _ActiveTask(cancel_event=asyncio.Event())
-            self._active_tasks[session_key] = active_task
+        prep = self._prepare_ai_request(request)
+        active_task = prep.active_task
 
         def on_prepared(messages: list[dict[str, Any]]) -> None:
             """prepare 完成回调：记录发送给主模型的 messages。"""
@@ -745,35 +732,39 @@ class Bot:
                 active_task.context_messages = messages
 
         # 调用 LLM
-        reply = await self._ai_chat.chat(
-            session_key,
-            user_message,
-            env_header,
-            last_ref_msg_id=last_ref_id,
-            image_urls=all_image_urls or None,
-            display_name=data.get("display_name"),
+        result = await self._ai_chat.chat(
+            prep.session_key,
+            prep.user_message,
+            prep.env_header,
+            last_ref_msg_id=prep.last_ref_id,
+            image_urls=prep.all_image_urls or None,
+            display_name=prep.display_name,
             on_prepared=on_prepared if active_task else None,
         )
 
         # 截断器：检查是否被打断
         if active_task:
             active_task.completed = True
-            self._active_tasks.pop(session_key, None)
+            self._active_tasks.pop(prep.session_key, None)
 
             if active_task.cancel_event.is_set():
-                _logger.info(f"回复被打断，重新处理 (session={session_key})")
-                await self._reprocess_after_interrupt(request, session_key)
+                _logger.info(f"回复被打断，重新处理 (session={prep.session_key})")
+                await self._reprocess_after_interrupt(request, prep.session_key)
                 return
 
+        if not result.success:
+            _logger.warning(f"AI 请求失败: {result.error}")
+            return
+
         transformed_reply = await self._send_reply(
-            reply,
-            send_func=send_func,
-            poke_func=poke_func,
-            session_key=session_key,
+            result.reply,
+            send_func=prep.send_func,
+            poke_func=prep.poke_func,
+            session_key=prep.session_key,
         )
 
         # 如果有 poke 标签被替换，更新数据库中的 AI 回复
-        if transformed_reply != reply:
+        if transformed_reply != result.reply:
             await self._ai_chat.update_last_assistant_reply(
                 session_key, transformed_reply
             )
@@ -881,7 +872,7 @@ class Bot:
         )
         await self._process_ai_request(new_request)
 
-    # ---- 消息发送 ----
+    # ---- 消息发送（委托给 MessageSender） ----
 
     async def send_group_msg(
         self,
@@ -891,57 +882,10 @@ class Bot:
         *,
         session_key: str | None = None,
     ) -> int | None:
-        """发送群聊消息并主动收集到 chat_log。
-
-        将文本中的 <at qq="..."/> 标签解析为 OneBot at 消息段，
-        以消息段数组格式发送。当 reply_id 不为 None 时，在消息段
-        数组最前面插入 reply 类型段以实现引用回复。
-
-        Args:
-            group_id: 目标群号。
-            message: 消息文本（可能包含 <at> 标签）。
-            reply_id: 要引用的消息 ID（可选）。
-            session_key: 会话标识（用于 chat_log 写入）。
-                如果不提供，默认为 group_{group_id}。
-
-        Returns:
-            发送成功时返回 message_id，失败时返回 None。
-        """
-        segments = text_to_segments(message)
-        if reply_id is not None:
-            segments.insert(0, {"type": "reply", "data": {"id": str(reply_id)}})
-
-        try:
-            result = await self._ws_server.call_api(
-                "send_group_msg",
-                {"group_id": group_id, "message": segments},
-            )
-            msg_id = result.get("message_id") if isinstance(result, dict) else None
-        except Exception as e:
-            self._logger.error(f"发送群聊消息失败: {e}")
-            return None
-
-        # 主动写入 chat_log
-        if msg_id is not None:
-            sk = session_key or f"group_{group_id}"
-            login_info = await self._bot_info.get_login_info()
-            entry = ChatLogEntry(
-                message_id=msg_id,
-                session_key=sk,
-                user_id=login_info.user_id,
-                nickname=login_info.nickname or str(login_info.user_id),
-                card="",
-                role="",
-                level="",
-                title="",
-                is_friend=False,
-                timestamp=time.time(),
-                text=message,
-                is_bot=True,
-            )
-            self._chat_log.add(entry)
-
-        return msg_id
+        """发送群聊消息（委托给 MessageSender）。"""
+        return await self._msg_sender.send_group_msg(
+            group_id, message, reply_id, session_key=session_key
+        )
 
     async def send_private_msg(
         self,
@@ -951,117 +895,16 @@ class Bot:
         *,
         session_key: str | None = None,
     ) -> int | None:
-        """发送私聊消息并主动收集到 chat_log。
-
-        将文本中的 <at qq="..."/> 标签解析为 OneBot at 消息段，
-        以消息段数组格式发送。当 reply_id 不为 None 时，在消息段
-        数组最前面插入 reply 类型段以实现引用回复。
-
-        Args:
-            user_id: 目标用户 QQ 号。
-            message: 消息文本（可能包含 <at> 标签）。
-            reply_id: 要引用的消息 ID（可选）。
-            session_key: 会话标识（用于 chat_log 写入）。
-                如果不提供，默认为 friend_{user_id}。
-
-        Returns:
-            发送成功时返回 message_id，失败时返回 None。
-        """
-        segments = text_to_segments(message)
-        if reply_id is not None:
-            segments.insert(0, {"type": "reply", "data": {"id": str(reply_id)}})
-
-        try:
-            result = await self._ws_server.call_api(
-                "send_private_msg",
-                {"user_id": user_id, "message": segments},
-            )
-            msg_id = result.get("message_id") if isinstance(result, dict) else None
-        except Exception as e:
-            self._logger.error(f"发送私聊消息失败: {e}")
-            return None
-
-        # 主动写入 chat_log
-        if msg_id is not None:
-            sk = session_key or f"friend_{user_id}"
-            login_info = await self._bot_info.get_login_info()
-            entry = ChatLogEntry(
-                message_id=msg_id,
-                session_key=sk,
-                user_id=login_info.user_id,
-                nickname=login_info.nickname or str(login_info.user_id),
-                card="",
-                role="",
-                level="",
-                title="",
-                is_friend=False,
-                timestamp=time.time(),
-                text=message,
-                is_bot=True,
-            )
-            self._chat_log.add(entry)
-
-        return msg_id
+        """发送私聊消息（委托给 MessageSender）。"""
+        return await self._msg_sender.send_private_msg(
+            user_id, message, reply_id, session_key=session_key
+        )
 
     async def send_poke(
         self, target_id: int, group_id: int | None = None
     ) -> tuple[bool, str]:
-        """发送戳一戳动作。
-
-        Args:
-            target_id: 被戳用户的 QQ 号。
-            group_id: 群号（群聊时提供，私聊时为 None）。
-
-        Returns:
-            (成功与否, 互动文案或失败原因)
-        """
-        # 1. 速率限制检查
-        reject_reason = self._poke_limiter.check(target_id)
-        if reject_reason:
-            return False, reject_reason
-
-        # 2. 调用 OneBot API（优先使用 group_poke/friend_poke，失败后降级到 send_poke）
-        try:
-            if group_id:
-                try:
-                    await self._ws_server.call_api(
-                        "group_poke",
-                        {"group_id": group_id, "user_id": target_id},
-                        timeout=5.0,
-                    )
-                except Exception:
-                    # 降级到 send_poke
-                    await self._ws_server.call_api(
-                        "send_poke",
-                        {"group_id": group_id, "user_id": target_id},
-                        timeout=5.0,
-                    )
-            else:
-                try:
-                    await self._ws_server.call_api(
-                        "friend_poke",
-                        {"user_id": target_id},
-                        timeout=5.0,
-                    )
-                except Exception:
-                    # 降级到 send_poke
-                    await self._ws_server.call_api(
-                        "send_poke",
-                        {"user_id": target_id},
-                        timeout=5.0,
-                    )
-        except Exception as e:
-            return False, f"戳一戳发送失败: {e}"
-
-        # 3. 记录成功
-        self._poke_limiter.record(target_id)
-
-        # 4. 构建互动文案
-        login_info = await self._bot_info.get_login_info()
-        bot_name = login_info.nickname or str(login_info.user_id)
-        poke_text = f"{bot_name}({login_info.user_id}) 戳了戳 {target_id}"
-
-        return True, poke_text
+        """发送戳一戳（委托给 MessageSender）。"""
+        return await self._msg_sender.send_poke(target_id, group_id)
 
     # ---- 辅助方法 ----
 
@@ -1253,9 +1096,6 @@ class Bot:
     # 引用回复内容截断上限（字符数）
     _REPLY_CONTENT_MAX_CHARS = 80
 
-    # 北京时间 UTC+8
-    _CST = timezone(timedelta(hours=8))
-
     async def _resolve_reply(self, content: str, event: MessageEvent) -> str:
         """解析消息中的回复段，将占位符替换为被引用消息的详情。
 
@@ -1340,7 +1180,7 @@ class Bot:
         # 时间戳格式化
         timestamp = data.get("time", 0)
         try:
-            dt = datetime.fromtimestamp(timestamp, tz=self._CST)
+            dt = datetime.fromtimestamp(timestamp, tz=TZ_CST)
             time_str = dt.strftime("%H:%M:%S")
         except (OSError, ValueError):
             time_str = "??:??:??"

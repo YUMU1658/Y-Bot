@@ -6,33 +6,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ybot.models.message import parse_message, segments_to_content
+from ybot.tools._common import format_timestamp
 from ybot.tools.base import BaseTool, ToolContext, ToolResult
 from ybot.utils.logger import get_logger
 
 logger = get_logger("查看工具")
 
-# 东八区时区
-_TZ_CST = timezone(timedelta(hours=8))
-
 # 用户头像 URL 模板
 _USER_AVATAR_URL = "https://q.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
 # 群头像 URL 模板
 _GROUP_AVATAR_URL = "https://p.qlogo.cn/gh/{group_id}/{group_id}/640/"
-
-
-def _format_timestamp(ts: int) -> str:
-    """将 Unix 时间戳格式化为可读时间。"""
-    if not ts:
-        return "未知"
-    try:
-        dt = datetime.fromtimestamp(ts, tz=_TZ_CST)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except (OSError, ValueError):
-        return "未知"
 
 
 class ViewerTool(BaseTool):
@@ -165,7 +151,7 @@ class ViewerTool(BaseTool):
 
         # 时间戳格式化
         timestamp = data.get("time", 0)
-        time_str = _format_timestamp(timestamp)
+        time_str = format_timestamp(timestamp)
 
         # 解析消息段，生成完整文本内容（不截断）
         raw_message_data = data.get("message", [])

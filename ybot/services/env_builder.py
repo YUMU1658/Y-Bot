@@ -7,9 +7,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING
 
+from ybot.constants import ROLE_LABEL_MAP, TZ_CST
 from ybot.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -18,16 +19,6 @@ if TYPE_CHECKING:
     from ybot.storage.chat_log import ChatLogEntry
 
 logger = get_logger("ENV")
-
-# 北京时间 UTC+8
-_CST = timezone(timedelta(hours=8))
-
-# 角色中文映射
-_ROLE_MAP = {
-    "owner": "群主",
-    "admin": "管理员",
-    "member": "成员",
-}
 
 
 def _build_identity_parts(
@@ -53,36 +44,10 @@ def _build_identity_parts(
     Returns:
         格式化后的身份字符串。
     """
-    parts: list[str] = []
+    # 角色中文文本
+    role_text = ROLE_LABEL_MAP.get(role, "")
 
-    # 等级部分
-    if level:
-        if level.isdigit():
-            # 纯数字 → Lv.{数字}
-            parts.append(f"Lv.{level}")
-        else:
-            # 包含非数字字符 → 尝试提取数字部分
-            digits = "".join(c for c in level if c.isdigit())
-            if digits:
-                parts.append(f"Lv.{digits}({level})")
-            else:
-                # 纯文字等级名称
-                parts.append(f"({level})")
-
-    # 专属头衔
-    if title:
-        parts.append(f"「{title}」")
-
-    # 角色
-    role_text = _ROLE_MAP.get(role, "")
-    if role_text:
-        parts.append(role_text)
-
-    if not parts:
-        return ""
-
-    # 用 " | " 分隔等级/头衔组合 与 角色
-    # 等级和头衔紧挨，角色用 | 分隔
+    # 构建等级+头衔组合
     identity_prefix = ""
     if level or title:
         level_title_parts: list[str] = []
@@ -154,7 +119,7 @@ class EnvBuilder:
             group_line = f"Group: (ID:{group_id})"
 
         # 构建 Time 行
-        now = datetime.now(_CST)
+        now = datetime.now(TZ_CST)
         time_line = f"Time: {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)"
 
         # 构建 Self 行
@@ -191,7 +156,7 @@ class EnvBuilder:
 
         display_name = nickname or str(user_id)
 
-        now = datetime.now(_CST)
+        now = datetime.now(TZ_CST)
         time_line = f"Time: {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)"
 
         return f"[ENV]\nFriend: {display_name}(ID:friend_{user_id})\n{time_line}\nSelf: @{bot_nickname}({login_info.user_id})"
@@ -225,7 +190,7 @@ class EnvBuilder:
         group_info = await self._bot_info.get_group_info(source_group_id)
         group_name = group_info.group_name
 
-        now = datetime.now(_CST)
+        now = datetime.now(TZ_CST)
         time_line = f"Time: {now.strftime('%Y-%m-%d %H:%M')} (UTC+8)"
 
         if group_name:
@@ -316,7 +281,7 @@ class MessageFormatter:
         title = member.title
 
         # 构建元信息头
-        now = datetime.now(_CST)
+        now = datetime.now(TZ_CST)
         time_str = now.strftime("%H:%M:%S")
         header_parts = [f"#{msg_id} {time_str} {nickname}({user_id})"]
 
@@ -353,7 +318,7 @@ class MessageFormatter:
         Returns:
             格式化后的消息文本。
         """
-        now = datetime.now(_CST)
+        now = datetime.now(TZ_CST)
         time_str = now.strftime("%H:%M:%S")
         return f"[#{event.message_id} {time_str}]\n{text}"
 
@@ -380,7 +345,7 @@ class MessageFormatter:
             格式化后的文本。
         """
         # 时间戳转为 HH:MM:SS
-        dt = datetime.fromtimestamp(entry.timestamp, tz=_CST)
+        dt = datetime.fromtimestamp(entry.timestamp, tz=TZ_CST)
         time_str = dt.strftime("%H:%M:%S")
 
         # 戳一戳专用格式

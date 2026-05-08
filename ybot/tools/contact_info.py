@@ -7,35 +7,14 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from ybot.constants import DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT
+from ybot.tools._common import format_timestamp, sex_label
 from ybot.tools.base import BaseTool, ToolContext, ToolResult
 from ybot.utils.logger import get_logger
 
 logger = get_logger("联系人工具")
-
-# ── 常量 ──
-_DEFAULT_LIMIT = 50
-_MAX_LIMIT = 200
-# 东八区时区
-_TZ_CST = timezone(timedelta(hours=8))
-
-
-def _format_timestamp(ts: int) -> str:
-    """将 Unix 时间戳格式化为可读时间。"""
-    if not ts:
-        return "未知"
-    try:
-        dt = datetime.fromtimestamp(ts, tz=_TZ_CST)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-    except (OSError, ValueError):
-        return "未知"
-
-
-def _sex_label(raw: str) -> str:
-    """性别字段转中文。"""
-    return {"male": "男", "female": "女"}.get(raw, "未知")
 
 
 class ContactInfoTool(BaseTool):
@@ -175,8 +154,8 @@ class ContactInfoTool(BaseTool):
         # 2. 分页参数
         offset = max(0, int(arguments.get("offset", 0)))
         limit = min(
-            max(1, int(arguments.get("limit", _DEFAULT_LIMIT))),
-            _MAX_LIMIT,
+            max(1, int(arguments.get("limit", DEFAULT_PAGE_LIMIT))),
+            MAX_PAGE_LIMIT,
         )
 
         # offset 超出范围
@@ -311,8 +290,8 @@ class ContactInfoTool(BaseTool):
         # 3. 分页参数
         offset = max(0, int(arguments.get("offset", 0)))
         limit = min(
-            max(1, int(arguments.get("limit", _DEFAULT_LIMIT))),
-            _MAX_LIMIT,
+            max(1, int(arguments.get("limit", DEFAULT_PAGE_LIMIT))),
+            MAX_PAGE_LIMIT,
         )
 
         # offset 超出范围
@@ -438,7 +417,7 @@ class ContactInfoTool(BaseTool):
         # 性别
         sex = stranger_data.get("sex")
         if sex and sex != "unknown":
-            lines.append(f"· 性别：{_sex_label(sex)}")
+            lines.append(f"· 性别：{sex_label(sex)}")
 
         # 年龄
         age = stranger_data.get("age")
@@ -463,7 +442,7 @@ class ContactInfoTool(BaseTool):
         # 注册时间
         reg_time = stranger_data.get("reg_time")
         if reg_time:
-            lines.append(f"· 注册时间：{_format_timestamp(reg_time)}")
+            lines.append(f"· 注册时间：{format_timestamp(reg_time)}")
 
         # 登录天数
         login_days = stranger_data.get("login_days")

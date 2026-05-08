@@ -20,6 +20,10 @@ _GROUP_TTL = 300  # 群信息 5 分钟
 _MEMBER_TTL = 300  # 群成员信息 5 分钟
 _FRIEND_TTL = 600  # 好友列表 10 分钟
 
+# 缓存最大条目数（防止无界增长）
+_GROUP_CACHE_MAX = 500
+_MEMBER_CACHE_MAX = 5000
+
 
 def _normalize_level(raw: Any) -> str:
     """将 API 返回的 level 字段规范化为字符串。
@@ -128,6 +132,9 @@ class BotInfoService:
                 fetched_at=time.time(),
             )
             self._group_cache[group_id] = info
+            # 防止缓存无界增长：超过上限时清理最旧的条目
+            if len(self._group_cache) > _GROUP_CACHE_MAX:
+                self._evict_oldest_groups()
             return info
         except Exception as e:
             logger.warning(f"获取群信息失败 (group_id={group_id}): {e}")
@@ -166,6 +173,9 @@ class BotInfoService:
                 fetched_at=time.time(),
             )
             self._member_cache[key] = info
+            # 防止缓存无界增长：超过上限时清理最旧的条目
+            if len(self._member_cache) > _MEMBER_CACHE_MAX:
+                self._evict_oldest_members()
             return info
         except Exception as e:
             logger.warning(
@@ -215,3 +225,19 @@ class BotInfoService:
             logger.debug(f"好友列表已刷新，共 {len(self._friend_set)} 人")
         except Exception as e:
             logger.warning(f"获取好友列表失败: {e}")
+
+    def _evict_oldest_groups(self) -> None:
+        """清理最旧的群信息缓存条目，保留一半容量。"""
+        sorted_items = sorted(
+            self._group_cache.items(), key=lambda x: x[1].fetched_at
+        )
+        keep = _GROUP_CACHE_MAX // 2
+        self._group_cache = dict(sorted_items[len(sorted_items) - keep:])
+
+    def _evict_oldest_members(self) -> None:
+        """清理最旧的成员信息缓存条目，保留一半容量。"""
+        sorted_items = sorted(
+            self._member_cache.items(), key=lambda x: x[1].fetched_at
+        )
+        keep = _MEMBER_CACHE_MAX // 2
+        self._member_cache = dict(sorted_items[len(sorted_items) - keep:])

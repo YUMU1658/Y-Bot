@@ -37,6 +37,11 @@ class PokeLimiter:
         if today != self._daily_reset_date:
             self._daily_count = 0
             self._daily_reset_date = today
+            # 顺便清理过期的冷却记录，防止 _last_poke 无界增长
+            self._last_poke = {
+                tid: ts for tid, ts in self._last_poke.items()
+                if now - ts < self._cooldown
+            }
 
         # 每日上限
         if self._daily_count >= self._daily_limit:
