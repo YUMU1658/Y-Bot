@@ -174,7 +174,10 @@ def segment_to_content(seg: MessageSegment) -> str:
             msg_id = seg.data.get("id", "?")
             return f"[回复:#{msg_id}]"
         case "forward":
-            return "[合并转发消息]"
+            fwd_id = seg.data.get("id", "")
+            if fwd_id:
+                return f"「转发消息:#{fwd_id}」"
+            return "「转发消息 | 无法获取内容」"
         case "dice":
             result = seg.data.get("result", "?")
             return f"[骰子:结果={result}]"
@@ -275,3 +278,50 @@ def _file_based_to_content(label: str, seg: MessageSegment) -> str:
         parts.append(f"file:{file_hash}")
 
     return "[" + " ".join(parts) + "]"
+
+
+def _preview_segment_to_text(seg: MessageSegment) -> str:
+    """将单个消息段转为极短预览文本（用于转发消息预览）。
+
+    与 segment_to_text 类似但更简洁，专为转发消息预览设计：
+    - 嵌套转发显示为 [聊天记录]
+    - 自定义表情(sub_type=1)显示为 [动画表情]
+    - 其他类型委托给 segment_to_text
+    """
+    match seg.type:
+        case "text":
+            return seg.data.get("text", "")
+        case "image":
+            sub_type = seg.data.get("sub_type")
+            if sub_type == 1:
+                return "[动画表情]"
+            return "[图片]"
+        case "forward":
+            return "[聊天记录]"
+        case "at":
+            name = seg.data.get("name", "")
+            qq = seg.data.get("qq", "")
+            if name:
+                return f"@{name}"
+            return f"@{qq}" if qq else "@?"
+        case _:
+            return segment_to_text(seg)
+
+
+def preview_segments_to_text(
+    segments: list[MessageSegment], *, max_chars: int = 20
+) -> str:
+    """将消息段列表转为截断的预览文本（用于转发消息预览行）。
+
+    Args:
+        segments: 消息段列表。
+        max_chars: 预览文本最大字符数，超出部分截断并追加 ``...``。
+
+    Returns:
+        截断后的预览文本。
+    """
+    raw = "".join(_preview_segment_to_text(seg) for seg in segments)
+    raw = raw.strip()
+    if len(raw) > max_chars:
+        return raw[:max_chars] + "..."
+    return raw

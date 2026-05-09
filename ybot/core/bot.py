@@ -32,6 +32,7 @@ from ybot.models.event import (
 )
 from ybot.models.message import (
     parse_message,
+    preview_segments_to_text,
     segments_to_content,
     segments_to_text,
 )
@@ -319,6 +320,8 @@ class Bot:
                     text = self._extract_content(e)
                     # 解析引用/回复消息的详情
                     text = await self._resolve_reply(text, e)
+                    # 解析转发消息的详情
+                    text = await self._resolve_forward(text, e)
                     if text.strip():
                         session_key = f"group_{e.group_id}"
                         # 构建 ENV 头部
@@ -361,6 +364,8 @@ class Bot:
                 text = self._extract_content(e)
                 # 解析引用/回复消息的详情
                 text = await self._resolve_reply(text, e)
+                # 解析转发消息的详情
+                text = await self._resolve_forward(text, e)
                 if text.strip():
                     # 临时会话：sub_type 为 "group" 表示从群聊发起的临时私聊
                     if e.sub_type == "group":
@@ -933,6 +938,8 @@ class Bot:
 
         # 解析引用/回复消息的详情
         text = await self._resolve_reply(text, event)
+        # 解析转发消息的详情
+        text = await self._resolve_forward(text, event)
 
         # 群聊消息从 event.sender 获取群相关元数据
         if isinstance(event, GroupMessageEvent):
@@ -1221,6 +1228,173 @@ class Bot:
         return (
             f'[回复:#{msg_id} ← {nickname}({user_id}) {time_str} | "{reply_content}"]'
         )
+
+    # ---- 转发消息解析 ----
+
+    # 转发消息预览常量
+    _FORWARD_PREVIEW_MAX_ITEMS = 4   # 最多预览条数
+    _FORWARD_PREVIEW_MAX_CHARS = 20  # 每条预览最大字符数
+
+    @staticmethod
+    def _extract_node_info(node: dict) -> tuple[str, str, list]:
+        """从转发消息的 node 中提取发送者信息和消息段。
+
+        兼容两种格式：
+        - NapCat 格式：扁平 OB11Message（sender.nickname, user_id, message）
+        - go-cqhttp 格式：node 包装（data.nickname, data.user_id, data.message）
+
+        Returns:
+            (nickname, user_id, message_segments) 三元组。
+        """
+        # 优先尝试 NapCat 扁平格式（含 sender 字典）
+        sender = node.get("sender")
+        if isinstance(sender, dict) and sender:
+            nickname = sender.get("card") or sender.get("nickname") or ""
+            user_id = str(node.get("user_id", "")) if node.get("user_id") else ""
+            raw_segs = node.get("message", [])
+            if nickname or user_id or raw_segs:
+                return nickname, user_id, raw_segs if isinstance(raw_segs, list) else []
+
+        # 回退到 go-cqhttp node 包装格式
+        node_data = node.get("data", {}) if isinstance(node, dict) else {}
+        nickname = node_data.get("nickname", "")
+        user_id = str(node_data.get("user_id", "")) if node_data.get("user_id") else ""
+        raw_segs = node_data.get("message", [])
+        return nickname, user_id, raw_segs if isinstance(raw_segs, list) else []
+
+    async def _resolve_forward(self, content: str, event: MessageEvent) -> str:
+        """解析消息中的转发段，将占位符替换为带预览的转发消息详情。
+
+        遍历消息段查找 forward 类型，通过 get_forward_msg API 获取转发内容，
+        将 ``「转发消息:#<id>」`` 占位符替换为包含标题、消息数量和预览的完整格式。
+
+        成功格式::
+
+            「转发消息 | 群聊的聊天记录 | 共12条」
+              张三: 今天天气真好啊
+              李四: [图片]
+            「/转发消息」
+
+        失败降级::
+
+            「转发消息 | 无法获取内容」
+
+        Args:
+            content: 已提取的内容文本（包含 ``「转发消息:#id」`` 占位符）。
+            event: 消息事件（用于遍历消息段获取 forward id）。
+
+        Returns:
+            替换占位符后的内容文本。如果没有 forward 段则原样返回。
+        """
+        for seg in event.message:
+            if seg.type != "forward":
+                continue
+
+            forward_id = seg.data.get("id", "")
+            if not forward_id:
+                continue
+
+            placeholder = f"「转发消息:#{forward_id}」"
+            if placeholder not in content:
+                # 占位符不在 content 中，将解析结果追加到 content 末尾
+                self._logger.debug(
+                    f"占位符 {placeholder} 未在 content 中找到，追加到末尾"
+                )
+                resolved = await self._fetch_forward_detail(forward_id)
+                content = content + "\n" + resolved
+                continue
+
+            resolved = await self._fetch_forward_detail(forward_id)
+            content = content.replace(placeholder, resolved, 1)
+
+        return content
+
+    async def _fetch_forward_detail(self, forward_id: str) -> str:
+        """通过 get_forward_msg API 获取转发消息内容并格式化为预览文本。
+
+        Args:
+            forward_id: 转发消息的 ID（forward segment 的 data.id）。
+
+        Returns:
+            格式化后的转发消息预览文本。
+        """
+        try:
+            data = await self._ws_server.call_api(
+                "get_forward_msg", {"id": forward_id}, timeout=5.0
+            )
+        except Exception as e:
+            self._logger.debug(f"获取转发消息失败 (id={forward_id}): {e}")
+            return "「转发消息 | 无法获取内容」"
+
+        if not data:
+            return "「转发消息 | 无法获取内容」"
+
+        # 提取 messages 数组（每个元素是 node 对象）
+        messages = data.get("messages", [])
+        if not messages:
+            return "「转发消息 | 无法获取内容」"
+
+        total_count = len(messages)
+
+        # ---- 推断标题 ----
+        nicknames: list[str] = []
+        seen_names: set[str] = set()
+        is_group = False
+        for node in messages:
+            if not isinstance(node, dict):
+                continue
+            nickname, _, _ = self._extract_node_info(node)
+            if nickname and nickname not in seen_names:
+                seen_names.add(nickname)
+                nicknames.append(nickname)
+            # 检查 message_type 判断是否为群消息（NapCat 扁平格式提供此字段）
+            if not is_group and node.get("message_type") == "group":
+                is_group = True
+
+        if is_group:
+            title = "群聊的聊天记录"
+        elif len(nicknames) == 0:
+            title = "聊天记录"
+        elif len(nicknames) == 1:
+            title = f"{nicknames[0]}的聊天记录"
+        elif len(nicknames) == 2:
+            title = f"{nicknames[0]}和{nicknames[1]}的聊天记录"
+        elif len(nicknames) == 3:
+            title = f"{nicknames[0]}、{nicknames[1]}和{nicknames[2]}的聊天记录"
+        else:
+            title = f"{nicknames[0]}、{nicknames[1]}等{len(nicknames)}人的聊天记录"
+
+        # ---- 生成预览行 ----
+        preview_lines: list[str] = []
+        max_items = self._FORWARD_PREVIEW_MAX_ITEMS
+        max_chars = self._FORWARD_PREVIEW_MAX_CHARS
+
+        for node in messages[:max_items]:
+            if not isinstance(node, dict):
+                continue
+            nickname, user_id, raw_segs = self._extract_node_info(node)
+            sender_name = nickname or (str(user_id) if user_id else "?")
+
+            # 解析消息段
+            if isinstance(raw_segs, list) and raw_segs:
+                segs = parse_message(raw_segs)
+                preview_text = preview_segments_to_text(
+                    segs, max_chars=max_chars
+                )
+            else:
+                preview_text = ""
+
+            if not preview_text:
+                preview_text = "..."
+
+            preview_lines.append(f"  {sender_name}: {preview_text}")
+
+        # ---- 组装最终格式 ----
+        header = f"「转发消息 | {title} | 共{total_count}条」"
+        footer = "「/转发消息」"
+        body = "\n".join(preview_lines)
+
+        return f"{header}\n{body}\n{footer}"
 
     def _log_group_message(self, event: GroupMessageEvent) -> None:
         """格式化输出群聊消息日志。"""
