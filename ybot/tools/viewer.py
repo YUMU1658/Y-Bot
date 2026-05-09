@@ -1,6 +1,6 @@
 """查看工具实现。
 
-支持查看消息完整文字内容、消息中的图片/表情包、以及用户/群头像。
+支持查看消息完整内容（文字和/或图片）、以及用户/群头像。
 与引用消息的 80 字符截断互补——本工具可获取完整内容。
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ybot.models.message import parse_message, segments_to_content
+from ybot.models.message import MessageSegment, parse_message, segments_to_content
 from ybot.tools._common import format_timestamp
 from ybot.tools.base import BaseTool, ToolContext, ToolResult
 from ybot.utils.logger import get_logger
@@ -20,12 +20,15 @@ _USER_AVATAR_URL = "https://q.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640"
 # 群头像 URL 模板
 _GROUP_AVATAR_URL = "https://p.qlogo.cn/gh/{group_id}/{group_id}/640/"
 
+# view_message 的 include 参数合法值
+_VALID_INCLUDE = {"text", "image"}
+
 
 class ViewerTool(BaseTool):
     """查看工具。
 
-    通过 OneBot API 查看消息完整内容、消息中的图片、以及用户/群头像。
-    支持三种操作：view_message、view_message_image、view_avatar。
+    通过 OneBot API 查看消息完整内容（文字和/或图片）、以及用户/群头像。
+    支持两种操作：view_message、view_avatar。
     """
 
     @property
@@ -35,14 +38,13 @@ class ViewerTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "查看消息内容或头像图片。支持三种操作：\n"
-            '1. "view_message" — 通过消息ID获取消息的完整文字内容'
-            "（发送者、时间、完整消息文本），"
-            "适用于查看被截断的引用消息的完整内容。需要参数：message_id\n"
-            '2. "view_message_image" — 通过消息ID查看消息中的图片、'
-            "自定义表情、商城表情等图片内容，"
-            "适用于查看参考聊天记录中的图片/表情包。需要参数：message_id\n"
-            '3. "view_avatar" — 查看QQ用户或群的头像图片，'
+            "查看消息内容或头像图片。支持两种操作：\n"
+            '1. "view_message" — 通过消息ID获取消息的完整内容，'
+            "默认同时返回文字和图片。可通过 include 参数控制返回内容："
+            'include=["text"] 仅文字，include=["image"] 仅图片，'
+            '默认 ["text", "image"] 图文都返回。'
+            "需要参数：message_id\n"
+            '2. "view_avatar" — 查看QQ用户或群的头像图片，'
             "可查看好友/群友/陌生人的头像。"
             '需要参数：avatar_type（"user"或"group"）、target_id（QQ号或群号）'
         )
@@ -54,14 +56,22 @@ class ViewerTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["view_message", "view_message_image", "view_avatar"],
+                    "enum": ["view_message", "view_avatar"],
                     "description": "要执行的操作",
                 },
                 "message_id": {
                     "type": "integer",
+                    "description": "要查看的消息ID（view_message 操作需要）",
+                },
+                "include": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": ["text", "image"],
+                    },
                     "description": (
-                        "要查看的消息ID"
-                        "（view_message 和 view_message_image 操作需要）"
+                        "要查看的内容类型，默认同时返回文字和图片。"
+                        "至少选一个。（仅 view_message 操作可用）"
                     ),
                 },
                 "avatar_type": {
@@ -95,7 +105,13 @@ class ViewerTool(BaseTool):
             查看结果。
         """
         action = arguments.get("action", "")
-        if action not in ("view_message", "view_message_image", "view_avatar"):
+
+        # 向后兼容：旧的 view_message_image 映射到 view_message + include=["image"]
+        if action == "view_message_image":
+            arguments.setdefault("include", ["image"])
+            action = "view_message"
+
+        if action not in ("view_message", "view_avatar"):
             return ToolResult(
                 success=False,
                 message=f"未知操作: {action}",
@@ -103,8 +119,6 @@ class ViewerTool(BaseTool):
 
         if action == "view_message":
             return await self._handle_view_message(arguments, context)
-        if action == "view_message_image":
-            return await self._handle_view_message_image(arguments, context)
         # action == "view_avatar"
         return await self._handle_view_avatar(arguments, context)
 
@@ -119,24 +133,42 @@ class ViewerTool(BaseTool):
     ) -> ToolResult:
         """处理 ``view_message`` 操作。
 
-        通过 get_msg API 获取消息详情，解析消息段并返回完整文字内容。
-        不涉及图片，不依赖 enable_vision。
+        通过 get_msg API 获取消息详情，根据 ``include`` 参数返回文字和/或图片。
+        默认同时返回文字和图片内容。
 
         Args:
-            arguments: 工具调用参数（需要 message_id）。
+            arguments: 工具调用参数（需要 message_id，可选 include）。
             context: 工具执行上下文。
 
         Returns:
-            包含完整消息内容的结果。
+            包含消息内容（文字和/或图片）的结果。
         """
         message_id = arguments.get("message_id")
         if message_id is None:
             return ToolResult(
                 success=False,
-                message="查看消息内容需要提供 message_id 参数",
+                message="查看消息需要提供 message_id 参数",
             )
 
-        # 获取消息详情
+        # 解析 include 参数，默认图文都返回
+        raw_include = arguments.get("include")
+        if raw_include is None:
+            include = _VALID_INCLUDE.copy()
+        else:
+            include = set(raw_include) & _VALID_INCLUDE
+            if not include:
+                return ToolResult(
+                    success=False,
+                    message=(
+                        "include 参数无效，"
+                        "必须包含 \"text\" 和/或 \"image\""
+                    ),
+                )
+
+        want_text = "text" in include
+        want_image = "image" in include
+
+        # 获取消息详情（只调用一次 API）
         data = await self._fetch_message(int(message_id), context)
         if data is None:
             return ToolResult(
@@ -144,149 +176,73 @@ class ViewerTool(BaseTool):
                 message=f"获取消息失败: 消息不存在或已过期 (message_id={message_id})",
             )
 
-        # 提取发送者信息
-        sender = data.get("sender", {})
-        nickname = sender.get("nickname", "?")
-        user_id = data.get("user_id", "?")
-
-        # 时间戳格式化
-        timestamp = data.get("time", 0)
-        time_str = format_timestamp(timestamp)
-
-        # 解析消息段，生成完整文本内容（不截断）
+        # 解析消息段（只解析一次，文字和图片共用）
         raw_message_data = data.get("message", [])
+        segments: list[MessageSegment] | None = None
         if isinstance(raw_message_data, list) and raw_message_data:
             segments = parse_message(raw_message_data)
-            full_content = segments_to_content(segments)
-        else:
-            # 降级：使用 raw_message 字段
-            full_content = data.get("raw_message", "")
 
-        if not full_content.strip():
-            return ToolResult(
-                success=True,
-                message=(
-                    f"消息 #{message_id} — {nickname}({user_id}) {time_str}\n"
-                    "消息内容为空（可能已撤回或无法获取）"
-                ),
-            )
+        lines: list[str] = []
+        image_urls: list[str] | None = None
 
-        # 消息类型信息
-        msg_type = data.get("message_type", "")
-        group_id = data.get("group_id")
-        type_info = ""
-        if msg_type == "group" and group_id:
-            type_info = f" | 群:{group_id}"
-        elif msg_type == "private":
-            type_info = " | 私聊"
+        # ── 文字部分 ──
+        if want_text:
+            sender = data.get("sender", {})
+            nickname = sender.get("nickname", "?")
+            user_id = data.get("user_id", "?")
+            time_str = format_timestamp(data.get("time", 0))
 
-        lines: list[str] = [
-            f"消息 #{message_id} 的完整内容：",
-            f"· 发送者：{nickname}({user_id})",
-            f"· 时间：{time_str}{type_info}",
-            f"· 内容：{full_content}",
-        ]
+            if segments is not None:
+                full_content = segments_to_content(segments)
+            else:
+                full_content = data.get("raw_message", "")
 
-        return ToolResult(success=True, message="\n".join(lines))
+            msg_type = data.get("message_type", "")
+            group_id = data.get("group_id")
+            type_info = ""
+            if msg_type == "group" and group_id:
+                type_info = f" | 群:{group_id}"
+            elif msg_type == "private":
+                type_info = " | 私聊"
 
-    # ──────────────────────────────────────────────
-    #  view_message_image
-    # ──────────────────────────────────────────────
+            lines.append(f"消息 #{message_id} 的完整内容：")
+            lines.append(f"· 发送者：{nickname}({user_id})")
+            lines.append(f"· 时间：{time_str}{type_info}")
+            if full_content.strip():
+                lines.append(f"· 内容：{full_content}")
+            else:
+                lines.append("· 内容：（空，可能已撤回或无法获取）")
 
-    async def _handle_view_message_image(
-        self,
-        arguments: dict[str, Any],
-        context: ToolContext,
-    ) -> ToolResult:
-        """处理 ``view_message_image`` 操作。
+        # ── 图片部分 ──
+        if want_image and segments is not None:
+            img_urls, img_infos = self._extract_images(segments)
 
-        通过 get_msg API 获取消息详情，提取所有图片 URL，
-        根据 enable_vision 决定是否附带图片。
+            if img_urls:
+                lines.append(
+                    f"消息中找到 {len(img_urls)} 张图片："
+                )
+                for i, info in enumerate(img_infos, 1):
+                    lines.append(f"  {i}. {info}")
 
-        Args:
-            arguments: 工具调用参数（需要 message_id）。
-            context: 工具执行上下文。
+                if context.enable_vision:
+                    lines.append("图片已附带，请查看。")
+                    image_urls = img_urls
+                else:
+                    lines.append(
+                        "图片识别未启用，无法查看图片内容，仅提供图片元信息。"
+                    )
+            elif not want_text:
+                # 只查图片但消息中没有图片
+                lines.append(f"消息 #{message_id} 不包含图片")
+        elif want_image and segments is None and not want_text:
+            # 只查图片但消息段为空
+            lines.append(f"消息 #{message_id} 不包含图片")
 
-        Returns:
-            包含图片元信息和可选图片附件的结果。
-        """
-        message_id = arguments.get("message_id")
-        if message_id is None:
-            return ToolResult(
-                success=False,
-                message="查看消息图片需要提供 message_id 参数",
-            )
-
-        # 获取消息详情
-        data = await self._fetch_message(int(message_id), context)
-        if data is None:
-            return ToolResult(
-                success=False,
-                message=f"获取消息失败: 消息不存在或已过期 (message_id={message_id})",
-            )
-
-        # 解析消息段，提取图片 URL 和元信息
-        raw_message_data = data.get("message", [])
-        if not isinstance(raw_message_data, list) or not raw_message_data:
-            return ToolResult(
-                success=True,
-                message=f"消息 #{message_id} 不包含图片",
-            )
-
-        segments = parse_message(raw_message_data)
-        image_urls: list[str] = []
-        image_infos: list[str] = []
-
-        for seg in segments:
-            if seg.type != "image":
-                continue
-            url = seg.data.get("url")
-            if url:
-                image_urls.append(url)
-
-            # 收集元信息
-            sub_type = seg.data.get("sub_type")
-            label = "自定义表情" if sub_type == 1 else "图片"
-            info_parts = [label]
-            name = seg.data.get("name", "")
-            summary = seg.data.get("summary", "")
-            file_hash = seg.data.get("file", "")
-            if name:
-                info_parts.append(f'name:"{name}"')
-            if summary and summary not in ("[图片]", ""):
-                info_parts.append(f'summary:"{summary}"')
-            if file_hash:
-                info_parts.append(f"file:{file_hash}")
-            image_infos.append("[" + " ".join(info_parts) + "]")
-
-        if not image_urls:
-            return ToolResult(
-                success=True,
-                message=f"消息 #{message_id} 不包含图片",
-            )
-
-        # 构建文本结果
-        lines: list[str] = [
-            f"消息 #{message_id} 中找到 {len(image_urls)} 张图片：",
-        ]
-        for i, info in enumerate(image_infos, 1):
-            lines.append(f"  {i}. {info}")
-
-        if context.enable_vision:
-            lines.append("")
-            lines.append("图片已附带，请查看。")
-            return ToolResult(
-                success=True,
-                message="\n".join(lines),
-                image_urls=image_urls,
-            )
-        else:
-            lines.append("")
-            lines.append("图片识别未启用，无法查看图片内容，仅提供图片元信息。")
-            return ToolResult(
-                success=True,
-                message="\n".join(lines),
-            )
+        return ToolResult(
+            success=True,
+            message="\n".join(lines),
+            image_urls=image_urls,
+        )
 
     # ──────────────────────────────────────────────
     #  view_avatar
@@ -356,6 +312,47 @@ class ViewerTool(BaseTool):
     # ──────────────────────────────────────────────
     #  内部辅助方法
     # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_images(
+        segments: list[MessageSegment],
+    ) -> tuple[list[str], list[str]]:
+        """从消息段列表中提取所有图片 URL 和元信息。
+
+        Args:
+            segments: 已解析的消息段列表。
+
+        Returns:
+            ``(image_urls, image_infos)`` 元组：
+            - image_urls: 图片 URL 列表。
+            - image_infos: 对应的元信息描述列表。
+        """
+        image_urls: list[str] = []
+        image_infos: list[str] = []
+
+        for seg in segments:
+            if seg.type != "image":
+                continue
+            url = seg.data.get("url")
+            if url:
+                image_urls.append(url)
+
+            # 收集元信息
+            sub_type = seg.data.get("sub_type")
+            label = "自定义表情" if sub_type == 1 else "图片"
+            info_parts = [label]
+            name = seg.data.get("name", "")
+            summary = seg.data.get("summary", "")
+            file_hash = seg.data.get("file", "")
+            if name:
+                info_parts.append(f'name:"{name}"')
+            if summary and summary not in ("[图片]", ""):
+                info_parts.append(f'summary:"{summary}"')
+            if file_hash:
+                info_parts.append(f"file:{file_hash}")
+            image_infos.append("[" + " ".join(info_parts) + "]")
+
+        return image_urls, image_infos
 
     @staticmethod
     async def _fetch_message(
