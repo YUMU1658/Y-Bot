@@ -55,8 +55,10 @@ class ViewerTool(BaseTool):
             '2. "view_avatar" — 查看QQ用户或群的头像图片，'
             "可查看好友/群友/陌生人的头像。"
             '需要参数：avatar_type（"user"或"group"）、target_id（QQ号或群号）\n'
-            '3. "view_forward" — 查看合并转发消息的完整内容，'
-            "通过转发消息ID获取所有子消息。"
+            '3. "view_forward" — 查看合并转发消息的内容，'
+            "通过转发消息ID获取子消息。"
+            "默认返回前30条消息，可通过 start（起始位置，从1开始，负数表示从末尾倒数）"
+            "和 limit（最多条数）参数控制范围。"
             "需要参数：forward_id"
         )
 
@@ -101,6 +103,21 @@ class ViewerTool(BaseTool):
                     "type": "integer",
                     "description": (
                         "QQ号或群号（仅 view_avatar 操作需要）"
+                    ),
+                },
+                "start": {
+                    "type": "integer",
+                    "description": (
+                        "起始消息位置（从1开始，默认1；"
+                        "负数表示从末尾倒数，如-50表示最后50条开始）"
+                        "（仅 view_forward 操作可用）"
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        "最多返回的消息条数（默认30）"
+                        "（仅 view_forward 操作可用）"
                     ),
                 },
             },
@@ -391,14 +408,51 @@ class ViewerTool(BaseTool):
             )
 
         total = len(messages)
-        lines: list[str] = [
-            f"转发消息 #{forward_id} 的完整内容（共{total}条）："
-        ]
+
+        # 解析范围参数
+        start = arguments.get("start", 1)
+        limit = arguments.get("limit", 30)
+
+        # 防御性处理
+        if not isinstance(start, int):
+            start = 1
+        if not isinstance(limit, int) or limit <= 0:
+            limit = 30
+        if start == 0:
+            start = 1
+
+        # 处理负数 start（从末尾倒数）
+        if start < 0:
+            start_idx = max(0, total + start)
+        else:
+            start_idx = max(0, start - 1)  # 转换为 0-based
+
+        end_idx = min(total, start_idx + limit)
+
+        # 切片
+        display_messages = messages[start_idx:end_idx]
+        display_start = start_idx + 1  # 1-based 起始
+        display_end = end_idx  # 1-based 结束
+
+        # 构建头部
+        if display_start == 1 and display_end == total:
+            # 显示全部消息
+            header_line = (
+                f"转发消息 #{forward_id} 的完整内容（共{total}条）："
+            )
+        else:
+            header_line = (
+                f"转发消息 #{forward_id} 的内容"
+                f"（共{total}条，当前显示第{display_start}-{display_end}条）："
+            )
+
+        lines: list[str] = [header_line]
         all_image_urls: list[str] = []
         # (node_index, url, info_str) 三元组
         all_image_infos: list[tuple[int, str, str]] = []
 
-        for idx, node in enumerate(messages, 1):
+        for i, node in enumerate(display_messages):
+            idx = start_idx + i + 1  # 原始 1-based 索引
             nickname, user_id, raw_segs = self._extract_forward_node(node)
 
             # 提取时间戳（兼容 NapCat 扁平格式和 go-cqhttp 包装格式）
@@ -466,6 +520,14 @@ class ViewerTool(BaseTool):
                 lines.append(
                     "图片识别未启用，无法查看图片内容，仅提供图片元信息。"
                 )
+
+        # 截断提示
+        remaining = total - display_end
+        if remaining > 0:
+            lines.append(
+                f"\n（还有{remaining}条消息未显示，"
+                "可通过 start/limit 参数查看更多）"
+            )
 
         return ToolResult(
             success=True,
