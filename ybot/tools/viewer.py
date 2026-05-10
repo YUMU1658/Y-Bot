@@ -32,6 +32,13 @@ class ViewerTool(BaseTool):
     支持三种操作：view_message、view_avatar、view_forward。
     """
 
+    _FORWARD_CACHE_MAX_SIZE = 200  # 最多缓存 200 个嵌套转发 ID
+
+    def __init__(self) -> None:
+        # forward_id → {"messages": [...]} 的缓存
+        # 用于存储从外层转发消息中提取的嵌套转发内容
+        self._forward_cache: dict[str, dict[str, Any]] = {}
+
     @property
     def name(self) -> str:
         return "viewer"
@@ -594,11 +601,84 @@ class ViewerTool(BaseTool):
             raw_segs if isinstance(raw_segs, list) else [],
         )
 
-    @staticmethod
+    def _cache_nested_forwards(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        depth: int = 0,
+        max_depth: int = 5,
+    ) -> None:
+        """递归扫描转发消息中的嵌套 forward segment，缓存其内联内容。
+
+        NapCat 的 ``get_forward_msg`` 会将嵌套转发的完整内容内联在
+        forward segment 的 ``data.content`` 中。本方法将这些内容提取出来，
+        以嵌套 forward 的 ``data.id`` 为 key 缓存到 ``_forward_cache``，
+        供后续 ``_fetch_forward`` 直接返回，避免再次调用 API（NapCat 会报错
+        "消息已过期或者为内层消息"）。
+
+        Args:
+            messages: get_forward_msg 返回的 messages 数组（node 列表）。
+            depth: 当前递归深度。
+            max_depth: 最大递归深度，防止恶意构造的深层嵌套。
+        """
+        if depth >= max_depth:
+            return
+        if len(self._forward_cache) >= self._FORWARD_CACHE_MAX_SIZE:
+            return  # 缓存已满，停止缓存新条目
+
+        for node in messages:
+            if not isinstance(node, dict):
+                continue
+
+            # 获取消息段列表（兼容 NapCat 扁平格式和 go-cqhttp 包装格式）
+            raw_segs = node.get("message", [])
+            if not isinstance(raw_segs, list):
+                node_data = node.get("data", {})
+                if isinstance(node_data, dict):
+                    raw_segs = node_data.get("message", [])
+                else:
+                    raw_segs = []
+
+            for seg in raw_segs:
+                if not isinstance(seg, dict):
+                    continue
+                if seg.get("type") != "forward":
+                    continue
+                seg_data = seg.get("data", {})
+                if not isinstance(seg_data, dict):
+                    continue
+
+                nested_id = seg_data.get("id")
+                content = seg_data.get("content")
+
+                if nested_id and isinstance(content, list) and content:
+                    nested_id_str = str(nested_id)
+                    # 将嵌套内容缓存为与 get_forward_msg 相同的格式
+                    self._forward_cache[nested_id_str] = {
+                        "messages": content,
+                    }
+                    logger.debug(
+                        f"缓存嵌套转发消息 (id={nested_id_str}, "
+                        f"depth={depth + 1}, "
+                        f"子消息数={len(content)})"
+                    )
+                    # 递归处理更深层的嵌套
+                    self._cache_nested_forwards(
+                        content,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                    )
+
+                    if len(self._forward_cache) >= self._FORWARD_CACHE_MAX_SIZE:
+                        return  # 缓存已满，提前退出
+
     async def _fetch_forward(
-        forward_id: str, context: ToolContext
+        self, forward_id: str, context: ToolContext
     ) -> dict[str, Any] | None:
-        """通过 get_forward_msg API 获取转发消息内容。
+        """通过缓存或 get_forward_msg API 获取转发消息内容。
+
+        优先查询内部缓存（嵌套转发内容），未命中时调用 API。
+        API 返回后自动扫描并缓存嵌套的转发内容。
 
         Args:
             forward_id: 转发消息 ID。
@@ -607,6 +687,15 @@ class ViewerTool(BaseTool):
         Returns:
             转发消息数据字典，失败时返回 None。
         """
+        # 1. 先查缓存（pop: 用完即删，避免内存泄漏）
+        cached = self._forward_cache.pop(forward_id, None)
+        if cached is not None:
+            logger.debug(f"从缓存获取嵌套转发消息 (id={forward_id})")
+            # 缓存的数据也可能包含更深层嵌套，递归缓存
+            self._cache_nested_forwards(cached.get("messages", []))
+            return cached
+
+        # 2. 缓存未命中，调用 API
         try:
             data = await context.ws_server.call_api(
                 "get_forward_msg",
@@ -619,5 +708,10 @@ class ViewerTool(BaseTool):
 
         if not data or not isinstance(data, dict):
             return None
+
+        # 3. 扫描并缓存嵌套的转发内容
+        messages = data.get("messages", [])
+        if messages:
+            self._cache_nested_forwards(messages)
 
         return data
