@@ -1,6 +1,6 @@
 """查看工具实现。
 
-支持查看消息完整内容（文字和/或图片）、以及用户/群头像。
+支持查看消息完整内容（文字和/或图片）、合并转发消息、以及用户/群头像。
 与引用消息的 80 字符截断互补——本工具可获取完整内容。
 """
 
@@ -27,8 +27,9 @@ _VALID_INCLUDE = {"text", "image"}
 class ViewerTool(BaseTool):
     """查看工具。
 
-    通过 OneBot API 查看消息完整内容（文字和/或图片）、以及用户/群头像。
-    支持两种操作：view_message、view_avatar。
+    通过 OneBot API 查看消息完整内容（文字和/或图片）、合并转发消息、
+    以及用户/群头像。
+    支持三种操作：view_message、view_avatar、view_forward。
     """
 
     @property
@@ -38,7 +39,7 @@ class ViewerTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "查看消息内容或头像图片。支持两种操作：\n"
+            "查看消息内容或头像图片。支持三种操作：\n"
             '1. "view_message" — 通过消息ID获取消息的完整内容，'
             "默认同时返回文字和图片。可通过 include 参数控制返回内容："
             'include=["text"] 仅文字，include=["image"] 仅图片，'
@@ -46,7 +47,10 @@ class ViewerTool(BaseTool):
             "需要参数：message_id\n"
             '2. "view_avatar" — 查看QQ用户或群的头像图片，'
             "可查看好友/群友/陌生人的头像。"
-            '需要参数：avatar_type（"user"或"group"）、target_id（QQ号或群号）'
+            '需要参数：avatar_type（"user"或"group"）、target_id（QQ号或群号）\n'
+            '3. "view_forward" — 查看合并转发消息的完整内容，'
+            "通过转发消息ID获取所有子消息。"
+            "需要参数：forward_id"
         )
 
     @property
@@ -56,12 +60,16 @@ class ViewerTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["view_message", "view_avatar"],
+                    "enum": ["view_message", "view_avatar", "view_forward"],
                     "description": "要执行的操作",
                 },
                 "message_id": {
                     "type": "integer",
                     "description": "要查看的消息ID（view_message 操作需要）",
+                },
+                "forward_id": {
+                    "type": "string",
+                    "description": "转发消息ID（仅 view_forward 操作需要）",
                 },
                 "include": {
                     "type": "array",
@@ -71,7 +79,7 @@ class ViewerTool(BaseTool):
                     },
                     "description": (
                         "要查看的内容类型，默认同时返回文字和图片。"
-                        "至少选一个。（仅 view_message 操作可用）"
+                        "至少选一个。（view_message / view_forward 操作可用）"
                     ),
                 },
                 "avatar_type": {
@@ -111,7 +119,7 @@ class ViewerTool(BaseTool):
             arguments.setdefault("include", ["image"])
             action = "view_message"
 
-        if action not in ("view_message", "view_avatar"):
+        if action not in ("view_message", "view_avatar", "view_forward"):
             return ToolResult(
                 success=False,
                 message=f"未知操作: {action}",
@@ -119,6 +127,8 @@ class ViewerTool(BaseTool):
 
         if action == "view_message":
             return await self._handle_view_message(arguments, context)
+        if action == "view_forward":
+            return await self._handle_view_forward(arguments, context)
         # action == "view_avatar"
         return await self._handle_view_avatar(arguments, context)
 
@@ -310,6 +320,153 @@ class ViewerTool(BaseTool):
             )
 
     # ──────────────────────────────────────────────
+    #  view_forward
+    # ──────────────────────────────────────────────
+
+    async def _handle_view_forward(
+        self,
+        arguments: dict[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        """处理 ``view_forward`` 操作。
+
+        通过 get_forward_msg API 获取合并转发消息的完整内容，
+        根据 ``include`` 参数返回文字和/或图片。
+
+        Args:
+            arguments: 工具调用参数（需要 forward_id，可选 include）。
+            context: 工具执行上下文。
+
+        Returns:
+            包含转发消息内容（文字和/或图片）的结果。
+        """
+        forward_id = arguments.get("forward_id")
+        if not forward_id:
+            return ToolResult(
+                success=False,
+                message="查看转发消息需要提供 forward_id 参数",
+            )
+
+        # 解析 include 参数，默认图文都返回
+        raw_include = arguments.get("include")
+        if raw_include is None:
+            include = _VALID_INCLUDE.copy()
+        else:
+            include = set(raw_include) & _VALID_INCLUDE
+            if not include:
+                return ToolResult(
+                    success=False,
+                    message=(
+                        "include 参数无效，"
+                        "必须包含 \"text\" 和/或 \"image\""
+                    ),
+                )
+
+        want_text = "text" in include
+        want_image = "image" in include
+
+        # 获取转发消息
+        data = await self._fetch_forward(str(forward_id), context)
+        if data is None:
+            return ToolResult(
+                success=False,
+                message=(
+                    "获取转发消息失败: "
+                    f"转发消息不存在或已过期 (forward_id={forward_id})"
+                ),
+            )
+
+        messages = data.get("messages", [])
+        if not messages:
+            return ToolResult(
+                success=False,
+                message=f"转发消息内容为空 (forward_id={forward_id})",
+            )
+
+        total = len(messages)
+        lines: list[str] = [
+            f"转发消息 #{forward_id} 的完整内容（共{total}条）："
+        ]
+        all_image_urls: list[str] = []
+        # (node_index, url, info_str) 三元组
+        all_image_infos: list[tuple[int, str, str]] = []
+
+        for idx, node in enumerate(messages, 1):
+            nickname, user_id, raw_segs = self._extract_forward_node(node)
+
+            # 提取时间戳（兼容 NapCat 扁平格式和 go-cqhttp 包装格式）
+            timestamp = node.get("time", 0)
+            if not timestamp:
+                timestamp = (node.get("data") or {}).get("time", 0)
+
+            # 构建发送者显示
+            if nickname and user_id:
+                sender = f"{nickname}({user_id})"
+            elif nickname:
+                sender = nickname
+            elif user_id:
+                sender = user_id
+            else:
+                sender = "?"
+
+            # 构建头部行
+            time_str = format_timestamp(timestamp) if timestamp else ""
+            header = f"[{idx}] {sender}"
+            if time_str and time_str != "未知":
+                header += f" {time_str}"
+
+            # 解析消息段
+            segments = (
+                parse_message(raw_segs)
+                if raw_segs and isinstance(raw_segs, list)
+                else []
+            )
+
+            # ── 文字部分 ──
+            if want_text:
+                content = (
+                    segments_to_content(segments) if segments else ""
+                )
+                if not content.strip():
+                    # 空消息：将提示追加到头部元信息行，防止伪造
+                    lines.append(f"\n{header} （无内容）")
+                else:
+                    lines.append(f"\n{header}")
+                    lines.append(content)
+
+            # ── 图片部分 ──
+            if want_image and segments:
+                img_urls, img_infos = self._extract_images(segments)
+                all_image_urls.extend(img_urls)
+                all_image_infos.extend(
+                    (idx, url, info)
+                    for url, info in zip(img_urls, img_infos)
+                )
+
+        # 图片汇总
+        image_urls: list[str] | None = None
+        if want_image and all_image_urls:
+            lines.append(
+                f"\n消息中共找到 {len(all_image_urls)} 张图片："
+            )
+            for node_idx, _url, info in all_image_infos:
+                lines.append(f"  消息[{node_idx}]: {info}")
+
+            if context.enable_vision:
+                lines.append("图片已附带，请查看。")
+                image_urls = [url for _, url, _ in all_image_infos]
+            else:
+                lines.append(
+                    "图片识别未启用，无法查看图片内容，仅提供图片元信息。"
+                )
+
+        return ToolResult(
+            success=True,
+            message="\n".join(lines),
+            image_urls=image_urls,
+        )
+
+    # ──────────────────────────────────────────────
     #  内部辅助方法
     # ──────────────────────────────────────────────
 
@@ -375,6 +532,89 @@ class ViewerTool(BaseTool):
             )
         except Exception as e:
             logger.warning(f"获取消息失败 (message_id={message_id}): {e}")
+            return None
+
+        if not data or not isinstance(data, dict):
+            return None
+
+        return data
+
+    @staticmethod
+    def _extract_forward_node(
+        node: dict[str, Any],
+    ) -> tuple[str, str, list[Any]]:
+        """从转发消息 node 中提取发送者信息和消息段。
+
+        兼容两种格式：
+
+        - NapCat 格式：扁平结构（sender.nickname, user_id, message）
+        - go-cqhttp 格式：node 包装（data.nickname, data.user_id, data.message）
+
+        与 ``bot.py`` 的 ``_extract_node_info`` 不同，此方法 **不** 读取
+        ``sender.card``（群名片），因为合并转发消息中的群名片不可靠。
+
+        Args:
+            node: 转发消息中的单条 node 字典。
+
+        Returns:
+            ``(nickname, user_id, message_segments)`` 三元组。
+            任何字段缺失时返回空字符串/空列表。
+        """
+        # NapCat 扁平格式
+        sender = node.get("sender")
+        if isinstance(sender, dict) and sender:
+            nickname = sender.get("nickname") or ""
+            user_id = (
+                str(node.get("user_id", ""))
+                if node.get("user_id")
+                else ""
+            )
+            raw_segs = node.get("message", [])
+            if nickname or user_id or raw_segs:
+                return (
+                    nickname,
+                    user_id,
+                    raw_segs if isinstance(raw_segs, list) else [],
+                )
+
+        # go-cqhttp node 包装格式
+        node_data = (
+            node.get("data", {}) if isinstance(node, dict) else {}
+        )
+        nickname = node_data.get("nickname", "")
+        user_id = (
+            str(node_data.get("user_id", ""))
+            if node_data.get("user_id")
+            else ""
+        )
+        raw_segs = node_data.get("message", [])
+        return (
+            nickname,
+            user_id,
+            raw_segs if isinstance(raw_segs, list) else [],
+        )
+
+    @staticmethod
+    async def _fetch_forward(
+        forward_id: str, context: ToolContext
+    ) -> dict[str, Any] | None:
+        """通过 get_forward_msg API 获取转发消息内容。
+
+        Args:
+            forward_id: 转发消息 ID。
+            context: 工具执行上下文。
+
+        Returns:
+            转发消息数据字典，失败时返回 None。
+        """
+        try:
+            data = await context.ws_server.call_api(
+                "get_forward_msg",
+                {"id": forward_id},
+                timeout=10.0,
+            )
+        except Exception as e:
+            logger.warning(f"获取转发消息失败 (id={forward_id}): {e}")
             return None
 
         if not data or not isinstance(data, dict):
