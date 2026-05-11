@@ -447,6 +447,14 @@ class ConversationStore:
         )
         await self._db.commit()
 
+    async def clear_all_sessions(self) -> None:
+        """清空所有会话的消息记录（保留 sessions 表记录）。"""
+        if not self._db:
+            raise RuntimeError("ConversationStore 未初始化，请先调用 initialize()")
+
+        await self._db.execute("DELETE FROM messages")
+        await self._db.commit()
+
     async def update_last_assistant_message(
         self, session_key: str, new_content: str
     ) -> None:

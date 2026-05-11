@@ -187,3 +187,21 @@ class SessionChatLog:
         if entry is None:
             return ""
         return entry.recall_hint
+
+    def clear(self, session_key: str) -> None:
+        """清空指定会话的聊天记录缓冲区。
+
+        同时从全局 ``_msg_index`` 中移除该会话所有条目的索引。
+
+        Args:
+            session_key: 会话标识。
+        """
+        buf = self._logs.pop(session_key, None)
+        if buf is not None:
+            for entry in buf:
+                self._msg_index.pop(entry.message_id, None)
+
+    def clear_all(self) -> None:
+        """清空所有会话的聊天记录缓冲区和全局索引。"""
+        self._logs.clear()
+        self._msg_index.clear()

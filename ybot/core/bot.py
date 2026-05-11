@@ -53,6 +53,9 @@ from ybot.services.reply_parser import (
 from ybot.services.worldbook import WorldBookService
 from ybot.storage.chat_log import ChatLogEntry, SessionChatLog
 from ybot.storage.conversation import ConversationStore
+from ybot.commands import CommandRegistry
+from ybot.commands.base import CommandContext, CommandResult
+from ybot.commands.clear import ClearCommand
 from ybot.tools import ToolRegistry
 from ybot.tools.contact_info import ContactInfoTool
 from ybot.tools.group_info import GroupInfoTool
@@ -193,6 +196,14 @@ class Bot:
         # 截断器状态：session_key → 当前处理任务的取消控制
         self._active_tasks: dict[str, _ActiveTask] = {}
 
+        # 初始化指令注册中心（仅当配置启用时）
+        self._cmd_registry: CommandRegistry | None = None
+        if config.commands.enabled:
+            self._cmd_registry = CommandRegistry()
+            self._cmd_registry.register(
+                ClearCommand(self._conv_store, self._chat_log)
+            )
+
         self._running = False
         self._bot_info_initialized = False
 
@@ -316,7 +327,22 @@ class Bot:
                 self._log_group_message(e)
                 # 收集所有群消息到上下文缓冲区（包括非 @bot 的）
                 await self._collect_message(e, session_key=f"group_{e.group_id}", is_bot=False)
-                if self._is_at_me(e):
+
+                # 指令拦截：在 AI 流程之前检测指令
+                session_key = f"group_{e.group_id}"
+                is_at_bot = self._is_at_me(e)
+                cmd_text = self._extract_command_text(e)
+                cmd_result = await self._try_handle_command(
+                    e, session_key, cmd_text, is_at_bot
+                )
+                if cmd_result is True:
+                    # 指令已处理（管理员执行或非管理员 block），不继续 AI 流程
+                    return
+                if cmd_result is False:
+                    # 非管理员 ignore 模式：当作普通消息，需要 @BOT 才走 AI 流程
+                    pass  # 继续下方的 _is_at_me 检查
+
+                if is_at_bot:
                     text = self._extract_content(e)
                     # 解析引用/回复消息的详情
                     text = await self._resolve_reply(text, e)
@@ -371,11 +397,26 @@ class Bot:
                     if e.sub_type == "group":
                         temp_group_id = e.raw_data.get("sender", {}).get("group_id", 0)
                         session_key = f"temp_{temp_group_id}_{e.user_id}"
+                    else:
+                        session_key = f"friend_{e.user_id}"
+
+                    # 指令拦截：在 AI 流程之前检测指令
+                    cmd_text = self._extract_command_text(e)
+                    cmd_result = await self._try_handle_command(
+                        e, session_key, cmd_text, is_at_bot=True
+                    )
+                    if cmd_result is True:
+                        # 指令已处理（管理员执行或非管理员 block），不继续 AI 流程
+                        return
+                    # cmd_result is False: 非管理员 ignore 模式，继续 AI 流程
+                    # cmd_result is None: 不是指令，继续 AI 流程
+
+                    # 构建 ENV 头部（移到指令检测之后，避免指令消息触发不必要的 API 调用）
+                    if e.sub_type == "group":
                         env_header = await self._env_builder.build_temp_env(
                             e.user_id, temp_group_id, e.sender.nickname
                         )
                     else:
-                        session_key = f"friend_{e.user_id}"
                         env_header = await self._env_builder.build_private_env(
                             e.user_id, e.sender.nickname
                         )
@@ -1076,6 +1117,120 @@ class Bot:
             包含所有消息段信息的内容文本。
         """
         return segments_to_content(event.message).strip()
+
+    @staticmethod
+    def _extract_command_text(event: MessageEvent) -> str:
+        """从消息段中提取纯文本（用于指令检测）。
+
+        跳过 at、reply 等非文本段，仅拼接 text 段内容。
+        与 ``_extract_content`` 不同——后者会保留 ``@`` 和富媒体标记，
+        而指令解析只需要纯文本。
+
+        Args:
+            event: 消息事件。
+
+        Returns:
+            纯文本内容（已 strip）。
+        """
+        parts: list[str] = []
+        for seg in event.message:
+            if seg.type == "text":
+                parts.append(seg.data.get("text", ""))
+        return "".join(parts).strip()
+
+    async def _try_handle_command(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        command_text: str,
+        is_at_bot: bool,
+    ) -> bool | None:
+        """尝试将消息作为指令处理。
+
+        完整的指令检测 → 权限校验 → 执行 → 回复流程。
+
+        Args:
+            event: 消息事件。
+            session_key: 当前会话标识。
+            command_text: 从消息中提取的纯文本（已 strip）。
+            is_at_bot: 群聊中是否 @了 BOT（私聊始终为 True）。
+
+        Returns:
+            - ``True``: 指令已处理，调用方应 return（不继续 AI 流程）。
+            - ``False``: 非管理员且 non_admin_behavior="ignore"，
+              调用方应将消息当作普通消息继续 AI 流程。
+            - ``None``: 不是指令或指令系统未启用，调用方自行决定。
+        """
+        if self._cmd_registry is None:
+            return None
+
+        cmd_config = self.config.commands
+
+        # 解析是否为已注册指令
+        parsed = self._cmd_registry.parse_command(command_text)
+        if parsed is None:
+            return None
+
+        cmd_name, args = parsed
+
+        # 群聊中检查 require_at_in_group
+        if isinstance(event, GroupMessageEvent):
+            if cmd_config.require_at_in_group and not is_at_bot:
+                # 需要 @BOT 但未 @，不作为指令处理
+                return None
+
+        # 检查管理员权限
+        is_admin = event.user_id in cmd_config.admins
+
+        if not is_admin:
+            if cmd_config.non_admin_behavior == "block":
+                # 拦截并完全不响应
+                return True
+            else:
+                # "ignore" — 当作普通消息，走正常 AI 流程
+                return False
+
+        # 管理员：执行指令
+        command = self._cmd_registry.get(cmd_name)
+        if command is None:
+            return None  # 理论上不会到这里
+
+        group_id = (
+            event.group_id if isinstance(event, GroupMessageEvent) else None
+        )
+        ctx = CommandContext(
+            session_key=session_key,
+            user_id=event.user_id,
+            group_id=group_id,
+            message_type=event.message_type,
+            is_admin=is_admin,
+            raw_args=args,
+            event=event,
+        )
+
+        try:
+            result = await command.execute(ctx)
+        except Exception as e:
+            self._logger.error(f"指令 /{cmd_name} 执行失败: {e}")
+            result = CommandResult(success=False, message=f"指令执行失败: {e}")
+
+        # 回复结果（不经过 ChatLog 和 ConversationStore）
+        if result.message:
+            try:
+                if isinstance(event, GroupMessageEvent):
+                    await self._ws_server.send_api(
+                        "send_group_msg",
+                        {"group_id": event.group_id, "message": result.message},
+                    )
+                else:
+                    await self._ws_server.send_api(
+                        "send_private_msg",
+                        {"user_id": event.user_id, "message": result.message},
+                    )
+            except Exception as e:
+                self._logger.error(f"指令结果回复失败: {e}")
+
+        return True
 
     @staticmethod
     def _extract_image_urls(event: MessageEvent) -> list[str]:
