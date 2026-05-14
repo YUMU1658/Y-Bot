@@ -188,6 +188,25 @@ class SessionChatLog:
             return ""
         return entry.recall_hint
 
+    def get_all_session_keys(self) -> list[str]:
+        """获取所有有消息记录的 session key 列表。
+
+        Returns:
+            当前缓冲区中存在消息记录的 session_key 列表（无特定顺序）。
+        """
+        return list(self._logs.keys())
+
+    def get_by_id(self, message_id: int) -> ChatLogEntry | None:
+        """通过 message_id 查找消息条目。
+
+        Args:
+            message_id: 消息的 message_id。
+
+        Returns:
+            对应的 ChatLogEntry，未找到返回 None。
+        """
+        return self._msg_index.get(message_id)
+
     def clear(self, session_key: str) -> None:
         """清空指定会话的聊天记录缓冲区。
 

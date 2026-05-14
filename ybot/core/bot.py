@@ -34,6 +34,7 @@ from ybot.tools import ToolRegistry
 from ybot.tools.contact_info import ContactInfoTool
 from ybot.tools.group_info import GroupInfoTool
 from ybot.tools.recall_msg import RecallMsgTool
+from ybot.tools.session_manager import SessionManagerTool
 from ybot.tools.viewer import ViewerTool
 from ybot.utils.logger import setup_logger
 
@@ -90,6 +91,7 @@ class Bot:
             self._tool_registry.register(GroupInfoTool())
             self._tool_registry.register(ContactInfoTool())
             self._tool_registry.register(ViewerTool())
+            self._tool_registry.register(SessionManagerTool())
 
         self._llm_client = LLMClient()
         self._ai_chat = AIChatService(
