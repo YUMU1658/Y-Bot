@@ -34,6 +34,21 @@ class ToolContext:
     enable_vision: bool = False
 
 
+@dataclass(frozen=True)
+class SessionSwitch:
+    """会话切换指令。
+
+    工具通过返回此对象通知外层对话循环切换活动会话。
+
+    Attributes:
+        session_key: 目标会话标识（如 ``group_123``、``friend_456``、``temp_111_222``）。
+        display_name: 目标会话的显示名称（可选，用于日志和跨会话记忆标识）。
+    """
+
+    session_key: str
+    display_name: str | None = None
+
+
 @dataclass
 class ToolResult:
     """工具执行结果。
@@ -44,11 +59,15 @@ class ToolResult:
         image_urls: 需要传递给 LLM 的图片 URL 列表（可选）。
             当工具需要让 LLM 看到图片时填充此字段，
             URL 可以是 QQ CDN 链接（由 ``process_image_url`` 下载转 base64）。
+        session_switch: 会话切换指令（可选）。
+            仅由 ``session_manager.switch_session`` 返回，
+            通知外层对话循环将本轮后续行为切换到目标会话。
     """
 
     success: bool
     message: str
     image_urls: list[str] | None = None
+    session_switch: SessionSwitch | None = None
 
 
 class BaseTool(ABC):

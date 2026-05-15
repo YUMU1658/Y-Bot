@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +22,33 @@ from ybot.services.reply_parser import (
 from ybot.utils.logger import get_logger
 
 logger = get_logger("Bot")
+
+# session_key 格式正则
+_SESSION_KEY_RE = re.compile(
+    r"^(group_(\d+)|friend_(\d+)|temp_(\d+)_(\d+))$"
+)
+
+
+@dataclass(frozen=True)
+class SessionRoute:
+    """从 session_key 解析出的发送路由信息。"""
+
+    session_key: str
+    kind: str  # "group" | "friend" | "temp"
+    target_id: int  # group_id 或 user_id
+    source_group_id: int | None = None  # 仅 temp 会话使用
+
+
+@dataclass(frozen=True)
+class RoutedAction:
+    """绑定了目标 session_key 的流式动作。
+
+    流式模式下，动作入队时绑定当时的 active session_key，
+    确保切换前已解析的动作仍发原会话，切换后的动作发目标会话。
+    """
+
+    session_key: str
+    action: ParsedAction
 
 
 @dataclass
@@ -103,16 +131,33 @@ class AIRequestHandler:
             logger.warning(f"AI 请求失败: {result.error}")
             return
 
+        # 确定最终目标 session（可能因 switch_session 而改变）
+        final_session_key = result.session_key or prep.session_key
+
+        # 如果发生了会话切换，使用动态路由发送
+        if result.session_key is not None:
+            route = self._resolve_session_route(final_session_key)
+            if route is None:
+                logger.warning(
+                    f"无法解析切换后的 session_key 路由: {final_session_key}"
+                )
+                return
+            send_func = self._make_send_func_for_route(route)
+            poke_func = self._make_poke_func_for_route(route)
+        else:
+            send_func = prep.send_func
+            poke_func = prep.poke_func
+
         transformed_reply = await self._send_reply(
             result.reply,
-            send_func=prep.send_func,
-            poke_func=prep.poke_func,
-            session_key=prep.session_key,
+            send_func=send_func,
+            poke_func=poke_func,
+            session_key=final_session_key,
         )
 
         if transformed_reply != result.reply:
             await self._ai_chat.update_last_assistant_reply(
-                prep.session_key, transformed_reply
+                final_session_key, transformed_reply
             )
 
     async def on_interrupt_check(
@@ -207,16 +252,31 @@ class AIRequestHandler:
         )
 
     async def _process_stream(self, request: PendingRequest) -> None:
-        """流式模式的 AI 请求处理。"""
+        """流式模式的 AI 请求处理。
+
+        使用 RoutedAction 队列，动作入队时绑定当时的 active session_key，
+        确保会话切换前已解析的动作仍发原会话，切换后的动作发目标会话。
+        """
         prep = self._prepare(request)
         active_task = prep.active_task
 
-        action_queue: asyncio.Queue[ParsedAction | None] = asyncio.Queue()
+        # 使用 RoutedAction 队列替代原始 ParsedAction 队列
+        action_queue: asyncio.Queue[RoutedAction | None] = asyncio.Queue()
         sent_messages: list[str] = []
         poke_replacements: list[tuple[str, str]] = []
 
+        # 当前活动 session_key（可被 on_session_switch 更新）
+        current_session_key = prep.session_key
+
         async def on_action(action: ParsedAction) -> None:
-            await action_queue.put(action)
+            # 入队时绑定当前 active session_key
+            await action_queue.put(RoutedAction(
+                session_key=current_session_key, action=action
+            ))
+
+        def on_session_switch(new_session_key: str) -> None:
+            nonlocal current_session_key
+            current_session_key = new_session_key
 
         def on_partial(full_response: str) -> None:
             if active_task:
@@ -228,23 +288,40 @@ class AIRequestHandler:
 
         async def sender_worker() -> None:
             while True:
-                action = await action_queue.get()
-                if action is None:
+                routed = await action_queue.get()
+                if routed is None:
                     break
                 await asyncio.sleep(1.0)
                 if active_task and active_task.cancel_event.is_set():
                     break
 
+                action = routed.action
+                action_session = routed.session_key
+
+                # 根据动作绑定的 session_key 动态路由
+                route = self._resolve_session_route(action_session)
+                if route is None:
+                    logger.warning(
+                        f"流式动作路由解析失败: {action_session}，使用原始发送函数"
+                    )
+                    # 降级：使用原始 prep 的发送函数
+                    send_func = prep.send_func
+                    poke_func = prep.poke_func
+                    action_session = prep.session_key
+                else:
+                    send_func = self._make_send_func_for_route(route)
+                    poke_func = self._make_poke_func_for_route(route)
+
                 if isinstance(action, ParsedMessage):
-                    await prep.send_func(action.content, action.reply_id)
+                    await send_func(action.content, action.reply_id)
                     sent_messages.append(action.content)
                 elif isinstance(action, ParsedPoke):
-                    success, text = await prep.poke_func(action.target_id)
+                    success, text = await poke_func(action.target_id)
                     original_tag = f'<poke target="{action.target_id}"/>'
                     if success:
                         replacement = f"[💢戳一戳] {text}"
                         await self.write_poke_chat_log(
-                            session_key=prep.session_key, poke_text=text
+                            session_key=action_session, poke_text=text
                         )
                     else:
                         replacement = f"[戳一戳失败: {text}]"
@@ -264,6 +341,7 @@ class AIRequestHandler:
                 cancel_event=active_task.cancel_event if active_task else None,
                 on_partial=on_partial if active_task else None,
                 on_prepared=on_prepared if active_task else None,
+                on_session_switch=on_session_switch,
             )
         finally:
             await action_queue.put(None)
@@ -285,6 +363,8 @@ class AIRequestHandler:
             logger.warning(f"流式 AI 请求失败: {result.error}")
             return
 
+        # 确定最终目标 session
+        final_session_key = result.session_key or prep.session_key
         reply = result.reply
 
         if poke_replacements and reply:
@@ -292,7 +372,7 @@ class AIRequestHandler:
             for original, replacement in poke_replacements:
                 transformed_reply = transformed_reply.replace(original, replacement, 1)
             await self._ai_chat.update_last_assistant_reply(
-                prep.session_key, transformed_reply
+                final_session_key, transformed_reply
             )
 
         if reply and not parse_reply_actions(reply):
@@ -392,6 +472,85 @@ class AIRequestHandler:
             f"重新处理请求 (session={session_key}，{len(merged_messages)} 条消息)"
         )
         await self.process(new_request)
+
+    # ── 会话路由 ──
+
+    @staticmethod
+    def _resolve_session_route(session_key: str) -> SessionRoute | None:
+        """从 session_key 解析发送路由。
+
+        Args:
+            session_key: 会话标识。
+
+        Returns:
+            SessionRoute 或 None（格式无效时）。
+        """
+        m = _SESSION_KEY_RE.match(session_key)
+        if not m:
+            return None
+
+        if m.group(2) is not None:
+            # group_{group_id}
+            return SessionRoute(
+                session_key=session_key,
+                kind="group",
+                target_id=int(m.group(2)),
+            )
+        elif m.group(3) is not None:
+            # friend_{user_id}
+            return SessionRoute(
+                session_key=session_key,
+                kind="friend",
+                target_id=int(m.group(3)),
+            )
+        else:
+            # temp_{source_group_id}_{user_id}
+            return SessionRoute(
+                session_key=session_key,
+                kind="temp",
+                target_id=int(m.group(5)),
+                source_group_id=int(m.group(4)),
+            )
+
+    def _make_send_func_for_route(
+        self, route: SessionRoute
+    ) -> Callable[[str, int | None], Awaitable[int | None]]:
+        """根据路由构造发送消息函数。
+
+        Args:
+            route: 目标会话路由。
+
+        Returns:
+            异步发送函数 (message, reply_id) -> msg_id。
+        """
+        if route.kind == "group":
+            return lambda msg, rid=None, gid=route.target_id, sk=route.session_key: (
+                self.send_group_msg(gid, msg, rid, session_key=sk)
+            )
+        else:
+            # friend 和 temp 都使用 send_private_msg
+            return lambda msg, rid=None, uid=route.target_id, sk=route.session_key: (
+                self.send_private_msg(uid, msg, rid, session_key=sk)
+            )
+
+    def _make_poke_func_for_route(
+        self, route: SessionRoute
+    ) -> Callable[[int], Awaitable[tuple[bool, str]]]:
+        """根据路由构造戳一戳函数。
+
+        Args:
+            route: 目标会话路由。
+
+        Returns:
+            异步戳一戳函数 (target_id) -> (success, text)。
+        """
+        if route.kind == "group":
+            return lambda tid, gid=route.target_id: self.send_poke(tid, gid)
+        else:
+            # 私聊和临时会话使用无 group_id 的 poke
+            return lambda tid: self.send_poke(tid, None)
+
+    # ── 底层发送 ──
 
     async def send_group_msg(
         self,

@@ -45,11 +45,14 @@ class ChatResult:
         success: 是否成功获取到 AI 回复。
         reply: AI 回复文本（成功时为回复内容，失败时为空字符串）。
         error: 错误描述（成功时为 None）。
+        session_key: 本轮最终活动会话标识（可能因 switch_session 而与初始不同）。
+            为 None 时表示未发生切换，调用方应使用原始 session_key。
     """
 
     success: bool
     reply: str = ""
     error: str | None = None
+    session_key: str | None = None
 
 
 @dataclass
@@ -298,6 +301,7 @@ class AIChatService:
             on_prepared(prepared.payload["messages"])
 
         # 4. 调用 API（非流式），支持 tool_calls 循环
+        initial_session_key = prepared.session_key
         try:
             reply = await self._chat_with_tools(prepared)
         except aiohttp.ClientError as e:
@@ -311,11 +315,14 @@ class AIChatService:
             # 内部错误消息（来自 _chat_with_tools），不存入数据库
             return ChatResult(success=False, error=reply.strip("[]"))
 
-        # 5. 存入 AI 回复
+        # 5. 存入 AI 回复（使用最终 active session）
         await self._store.add_message(prepared.session_key, "assistant", reply)
 
-        # 6. 返回
-        return ChatResult(success=True, reply=reply)
+        # 6. 返回（如果发生了会话切换，通过 session_key 通知调用方）
+        final_session_key = (
+            prepared.session_key if prepared.session_key != initial_session_key else None
+        )
+        return ChatResult(success=True, reply=reply, session_key=final_session_key)
 
     async def _chat_with_tools(self, prepared: _PreparedChat) -> str:
         """执行 API 调用，处理 tool_calls 循环。
@@ -402,6 +409,18 @@ class AIChatService:
                     func_name, func_args, prepared.session_key
                 )
 
+                # 检测会话切换
+                if result.session_switch is not None:
+                    new_key = result.session_switch.session_key
+                    logger.info(
+                        f"工具触发会话切换: {prepared.session_key} -> {new_key}"
+                    )
+                    prepared.session_key = new_key
+                    # 更新目标会话元数据
+                    await self._store.update_session_meta(
+                        new_key, result.session_switch.display_name
+                    )
+
                 # 构建 tool role message
                 tool_msg: dict[str, Any] = {
                     "role": "tool",
@@ -412,7 +431,7 @@ class AIChatService:
                 tool_results.append((tc, result.message))
                 tool_result_objects.append(result)
 
-            # 将工具调用记录存入数据库
+            # 将工具调用记录存入数据库（按该组 tool_calls 开始时的 session 保存）
             await self._store_tool_messages(
                 prepared.session_key, assistant_msg, tool_results
             )
@@ -622,6 +641,7 @@ class AIChatService:
         cancel_event: asyncio.Event | None = None,
         on_partial: Callable[[str], None] | None = None,
         on_prepared: Callable[[list[dict[str, Any]]], None] | None = None,
+        on_session_switch: Callable[[str], None] | None = None,
     ) -> ChatResult:
         """流式对话请求。
 
@@ -641,6 +661,8 @@ class AIChatService:
             cancel_event: 可选取消信号，被 set 时中止流式接收。
             on_partial: 可选回调，每次收到增量 delta 后调用，传递当前累积的完整响应。
             on_prepared: 可选回调，在 _prepare_chat 完成后调用，传递构建好的 messages 列表。
+            on_session_switch: 可选回调，工具触发会话切换时调用，传递新的 session_key。
+                用于通知发送层后续流式动作改用新会话。
 
         Returns:
             ChatResult 包含成功/失败状态和完整的 AI 回复文本。
@@ -663,6 +685,7 @@ class AIChatService:
         messages = prepared.payload["messages"]
         parser = StreamActionParser()
         cancelled = False
+        initial_session_key = prepared.session_key
 
         # 4. 流式调用 API，支持 tool_calls 循环
         try:
@@ -778,6 +801,21 @@ class AIChatService:
                         func_name, func_args, prepared.session_key
                     )
 
+                    # 检测会话切换
+                    if result.session_switch is not None:
+                        new_key = result.session_switch.session_key
+                        logger.info(
+                            f"流式模式工具触发会话切换: {prepared.session_key} -> {new_key}"
+                        )
+                        prepared.session_key = new_key
+                        # 更新目标会话元数据
+                        await self._store.update_session_meta(
+                            new_key, result.session_switch.display_name
+                        )
+                        # 通知发送层后续动作改用新会话
+                        if on_session_switch:
+                            on_session_switch(new_key)
+
                     tool_msg: dict[str, Any] = {
                         "role": "tool",
                         "tool_call_id": tc_id,
@@ -791,7 +829,7 @@ class AIChatService:
                     # 被取消时不存储不完整的工具调用记录
                     break
 
-                # 将工具调用记录存入数据库
+                # 将工具调用记录存入数据库（按当前 active session 保存）
                 await self._store_tool_messages(
                     prepared.session_key, assistant_msg, tool_results
                 )
@@ -864,10 +902,14 @@ class AIChatService:
 
         # 被截断器打断时不存入 AI 回复（不完整的回复不应进入历史）
         if not cancelled:
-            # 5. 存入 AI 回复
+            # 5. 存入 AI 回复（使用最终 active session）
             await self._store.add_message(prepared.session_key, "assistant", reply)
 
-        return ChatResult(success=True, reply=reply)
+        # 如果发生了会话切换，通过 session_key 通知调用方
+        final_session_key = (
+            prepared.session_key if prepared.session_key != initial_session_key else None
+        )
+        return ChatResult(success=True, reply=reply, session_key=final_session_key)
 
     async def update_last_assistant_reply(
         self, session_key: str, new_content: str

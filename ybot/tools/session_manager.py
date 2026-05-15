@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime
 from typing import Any
 
 from ybot.constants import TZ_CST
 from ybot.models.message import MessageSegment, parse_message, segment_to_text
-from ybot.tools.base import BaseTool, ToolContext, ToolResult
+from ybot.tools.base import BaseTool, SessionSwitch, ToolContext, ToolResult
 from ybot.utils.logger import get_logger
 
 logger = get_logger("会话管理工具")
@@ -40,8 +41,9 @@ class SessionManagerTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            "会话管理工具。查看最近的聊天会话列表，包括群聊、私聊和临时会话。\n"
-            "每个会话显示最新2条消息预览，并标注是否有人@bot或引用bot消息。"
+            "会话管理工具。查看最近的聊天会话列表，或切换活动会话。\n"
+            "recent_sessions：获取最近会话列表，每个会话显示最新2条消息预览和 session_key。\n"
+            "switch_session：切换本轮活动会话，后续发送消息和戳一戳将面向目标会话。"
         )
 
     @property
@@ -51,16 +53,28 @@ class SessionManagerTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["recent_sessions"],
-                    "description": "操作类型。recent_sessions：获取最近会话列表。",
+                    "enum": ["recent_sessions", "switch_session"],
+                    "description": (
+                        "操作类型。"
+                        "recent_sessions：获取最近会话列表。"
+                        "switch_session：切换本轮活动会话（后续发送/戳一戳将面向目标会话）。"
+                    ),
                 },
                 "count": {
                     "type": "integer",
-                    "description": "获取的会话数量，默认 20，最大 50。",
+                    "description": "获取的会话数量，默认 20，最大 50。仅 recent_sessions 使用。",
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "偏移量，用于翻页。默认 0 表示从最新开始。",
+                    "description": "偏移量，用于翻页。默认 0 表示从最新开始。仅 recent_sessions 使用。",
+                },
+                "session_key": {
+                    "type": "string",
+                    "description": (
+                        "目标会话 ID，仅 switch_session 时必填。"
+                        "格式：group_{群号}、friend_{QQ号}、temp_{来源群号}_{QQ号}。"
+                        "可从 recent_sessions 结果中获取。"
+                    ),
                 },
             },
             "required": ["action"],
@@ -82,8 +96,97 @@ class SessionManagerTool(BaseTool):
         match action:
             case "recent_sessions":
                 return await self._handle_recent_sessions(arguments, context)
+            case "switch_session":
+                return await self._handle_switch_session(arguments, context)
             case _:
                 return ToolResult(success=False, message=f"未知操作: {action}")
+
+    # ── switch_session ──
+
+    # session_key 格式正则
+    _SESSION_KEY_PATTERN = re.compile(
+        r"^(group_(\d+)|friend_(\d+)|temp_(\d+)_(\d+))$"
+    )
+
+    async def _handle_switch_session(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> ToolResult:
+        """切换本轮活动会话。
+
+        验证 session_key 格式，解析目标会话显示名，
+        返回包含 ``SessionSwitch`` 的 ``ToolResult``。
+
+        Args:
+            arguments: 工具调用参数（必须包含 session_key）。
+            context: 工具执行上下文。
+
+        Returns:
+            包含 session_switch 的工具结果。
+        """
+        session_key = arguments.get("session_key", "").strip()
+        if not session_key:
+            return ToolResult(
+                success=False,
+                message="缺少必填参数 session_key。格式：group_{群号}、friend_{QQ号}、temp_{来源群号}_{QQ号}。",
+            )
+
+        # 格式校验
+        m = self._SESSION_KEY_PATTERN.match(session_key)
+        if not m:
+            return ToolResult(
+                success=False,
+                message=(
+                    f"session_key 格式无效: {session_key}。"
+                    "合法格式：group_{{群号}}、friend_{{QQ号}}、temp_{{来源群号}}_{{QQ号}}。"
+                ),
+            )
+
+        # 不允许切换到当前会话
+        if session_key == context.session_key:
+            return ToolResult(
+                success=False,
+                message=f"目标会话与当前会话相同 ({session_key})，无需切换。",
+            )
+
+        # 解析目标会话并获取显示名
+        display_name: str
+        if session_key.startswith("group_"):
+            group_id = int(m.group(2))
+            try:
+                group_info = await context.bot_info.get_group_info(group_id)
+                display_name = group_info.group_name or f"群{group_id}"
+            except Exception:
+                display_name = f"群{group_id}"
+        elif session_key.startswith("friend_"):
+            user_id = int(m.group(3))
+            # 尝试通过 get_stranger_info 获取昵称
+            try:
+                stranger = await context.ws_server.call_api(
+                    "get_stranger_info", {"user_id": user_id}
+                )
+                if isinstance(stranger, dict) and stranger.get("nickname"):
+                    display_name = stranger["nickname"]
+                else:
+                    display_name = f"好友({user_id})"
+            except Exception:
+                display_name = f"好友({user_id})"
+        else:
+            # temp_{source_group_id}_{user_id}
+            source_group_id = int(m.group(4))
+            user_id = int(m.group(5))
+            display_name = f"临时会话({source_group_id}_{user_id})"
+
+        return ToolResult(
+            success=True,
+            message=(
+                f"已切换活动会话为 {display_name}(session_key={session_key})。"
+                "后续工具调用、发送消息和戳一戳将面向该会话。"
+            ),
+            session_switch=SessionSwitch(
+                session_key=session_key,
+                display_name=display_name,
+            ),
+        )
 
     # ── recent_sessions 主流程 ──
 
@@ -273,6 +376,12 @@ class SessionManagerTool(BaseTool):
         peer_id = session.get("peerUin", "?")
         type_label = CHAT_TYPE_LABELS.get(chat_type, "未知")
 
+        # 1.5 推导 session_key
+        if chat_type == 2:
+            session_key = f"group_{peer_id}"
+        else:
+            session_key = f"friend_{peer_id}"
+
         # 2. @bot 检测（扫描全部历史消息）
         mention_tags = await self._check_bot_mentions(messages, bot_id, context)
         tag_str = ""
@@ -281,8 +390,8 @@ class SessionManagerTool(BaseTool):
         if "reply-me" in mention_tags:
             tag_str += "【⚡💬RE】"
 
-        # 3. 标题行
-        header = f"{index}. {tag_str}{peer_name}({peer_id}) [{type_label}]"
+        # 3. 标题行（包含 session_key 供 switch_session 使用）
+        header = f"{index}. {tag_str}{peer_name}({peer_id}) [{type_label}] session_key={session_key}"
 
         # 4. 消息预览（最新 2 条）
         is_group = chat_type == 2
@@ -365,7 +474,7 @@ class SessionManagerTool(BaseTool):
             if "reply-me" in mention_tags:
                 tag_str += "【⚡💬RE】"
 
-            header = f"{i + offset + 1}. {tag_str}{display_name} [{type_label}]"
+            header = f"{i + offset + 1}. {tag_str}{display_name} [{type_label}] session_key={sk}"
 
             # 预览最新 2 条
             preview = entries[-PREVIEW_COUNT:]
